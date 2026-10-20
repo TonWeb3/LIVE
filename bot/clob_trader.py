@@ -451,11 +451,29 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+    def get_order(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch order details from Polymarket CLOB /data/order/<id> with Level 2 authentication."""
+        if not order_id or not self.ensure_ready() or not self.clob:
+            return None
+        try:
+            from polymarket_apis.types.clob_types import RequestArgs
+            from polymarket_apis.utilities.headers import create_level_2_headers
+            endpoint = f"/data/order/{order_id}"
+            request_args = RequestArgs(method="GET", request_path=endpoint)
+            headers = create_level_2_headers(self.clob.signer, self.clob.creds, request_args)
+            resp = self.clob.client.get(self.clob._build_url(endpoint), headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
     def check_order_status(self, order_id: str) -> Dict[str, Any]:
         """Check if an order is still open or has been filled on the CLOB."""
         if not order_id or not self.ensure_ready():
             return {"status": "unknown"}
         try:
+            # 1. Check open orders first
             orders = self.clob.get_orders(order_id=str(order_id))
             if orders and len(orders) > 0:
                 ord_info = orders[0]
@@ -465,7 +483,28 @@ class ClobTrader:
                 if original_size > 0 and size_matched >= original_size:
                     return {"status": "FILLED", "size_matched": size_matched, "price": d.get("price")}
                 return {"status": "OPEN", "size_matched": size_matched, "original_size": original_size, "price": d.get("price")}
-            # If not in open orders, it has been filled (or cancelled)
+
+            # 2. If not in open orders, query order directly from CLOB /data/order/<id>
+            direct = self.get_order(str(order_id))
+            if direct:
+                status_raw = str(direct.get("status") or "").upper()
+                size_matched = float(direct.get("size_matched") or 0.0)
+                original_size = float(direct.get("original_size") or 0.0)
+                price = float(direct.get("price") or 0.0)
+                if status_raw in ("MATCHED", "FILLED") or (original_size > 0 and size_matched >= original_size) or size_matched > 0:
+                    return {"status": "FILLED", "size_matched": size_matched if size_matched > 0 else original_size, "price": price}
+                elif status_raw in ("CANCELLED", "CANCELED"):
+                    return {"status": "CANCELLED", "size_matched": size_matched}
+
+            # 3. Check recent trades for this order
+            trades = self.clob.get_trades()
+            if trades:
+                for t in trades[:10]:
+                    td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    if str(td.get("taker_order_id") or "") == str(order_id) or str(order_id) in str(td.get("maker_orders") or []):
+                        return {"status": "FILLED", "size_matched": float(td.get("size") or 0.0), "price": float(td.get("price") or 0.0)}
+
+            # If not in open orders and not matched, it was closed/cancelled
             return {"status": "CLOSED"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
