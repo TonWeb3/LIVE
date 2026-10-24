@@ -40,8 +40,8 @@ TELEGRAM_SUBS_PATH = "telegram_subscribers.json"
 _ws_clients = set()
 
 # ── Event-driven early entries & wakeups ───────────────────────────────────────
-MIN_EVAL_INTERVAL_S = 0.02  # Ultra-fast 20ms evaluation interval on rapid tick bursts
-CTX_MAX_AGE_S = 30.0        # Decoupled from 1-second REST poll loop
+MIN_EVAL_INTERVAL_S = 0.25  # Evaluates up to 4 times per second (from TOG-main)
+CTX_MAX_AGE_S = 4.0        # 4.0s context validity from TOG-main
 POLY_WS_MAX_AGE_MS = 2500
 MARK_CAPTURE_WINDOW_MS = 20_000
 
@@ -349,7 +349,7 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
     symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
 )
-polymarket_clob_ws = ws_data.PolymarketClobMarketStream(on_update=_wake_entry)
+polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
@@ -368,20 +368,52 @@ def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
         "remainingMinutes": remaining_ms / 60_000
     }
 
-async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+_cached_market = None
+_cached_market_ts = 0.0
+_cached_market_series = ""
+
+async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
+    global _cached_market, _cached_market_ts, _cached_market_series
+    now = time.time()
+    curr_target = settings.POLYMARKET_SLUG or settings.POLYMARKET_SERIES_ID
+    if not force and _cached_market and _cached_market_series == curr_target:
+        end_date = _cached_market.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
+                if end_ts > now + 15 and (now - _cached_market_ts) < 30.0:
+                    return _cached_market
+            except Exception:
+                pass
+        elif (now - _cached_market_ts) < 30.0:
+            return _cached_market
+
     market = None
-    if settings.POLYMARKET_SLUG:
-        market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
-    elif settings.POLYMARKET_AUTO_SELECT_LATEST:
-        events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
-        markets = data.flatten_event_markets(events)
+    try:
+        if settings.POLYMARKET_SLUG:
+            market = await data.fetch_market_by_slug(settings.POLYMARKET_SLUG)
+        elif settings.POLYMARKET_AUTO_SELECT_LATEST:
+            events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
+            markets = data.flatten_event_markets(events)
+            now_ms = now * 1000
+            live_markets = [
+                m for m in markets
+                if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now_ms
+            ]
+            if live_markets:
+                live_markets.sort(key=lambda x: x["endDate"])
+                market = live_markets[0]
+    except Exception as e:
+        print(f"Warning: Market discovery error: {e}")
 
-        now = time.time() * 1000
-        live_markets = [m for m in markets if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now]
-        if live_markets:
-            live_markets.sort(key=lambda x: x["endDate"])
-            market = live_markets[0]
+    if market:
+        _cached_market = market
+        _cached_market_ts = now
+        _cached_market_series = curr_target
+    return _cached_market
 
+async def fetch_polymarket_snapshot() -> Dict[str, Any]:
+    market = await get_active_market()
     if not market:
         return {"ok": False, "reason": "market_not_found"}
 
@@ -463,6 +495,18 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
 
     # Track whether the book data came from WS or REST
     book_source = "ws" if ((up_ws.get("bids") or up_ws.get("asks")) and (down_ws.get("bids") or down_ws.get("asks"))) else "rest"
+    # Smooth out prices with previous valid state to prevent visual glitching if a poll momentarily drops
+    final_up = up_buy if up_buy is not None else gamma_yes
+    final_down = down_buy if down_buy is not None else gamma_no
+    if final_up is not None:
+        state["last_poly_up"] = final_up
+    else:
+        final_up = state.get("last_poly_up")
+
+    if final_down is not None:
+        state["last_poly_down"] = final_down
+    else:
+        final_down = state.get("last_poly_down")
 
     # Pre-warm active market tokens in CLOB client so order creation executes in <10ms
     if settings.PRIVATE_KEY:
@@ -475,8 +519,8 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         "ok": True,
         "market": market,
         "prices": {
-            "up": up_buy if up_buy is not None else gamma_yes,
-            "down": down_buy if down_buy is not None else gamma_no
+            "up": final_up,
+            "down": final_down
         },
         "token_ids": {
             "up": up_token_id,
@@ -748,15 +792,6 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
                 return "slot_busy"
 
-        # CONSTRAINT: Never re-enter a window that was already executed live
-        for t in state.get("trade_history", []):
-            if cur_slug and t.get("market_slug") == cur_slug:
-                if t.get("live_order_id") or t.get("live_status") in ("FILLED", "GTD_OPEN", "FILLING"):
-                    return "slot_already_executed"
-            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
-                if t.get("live_order_id") or t.get("live_status") in ("FILLED", "GTD_OPEN", "FILLING"):
-                    return "slot_already_executed"
-
         if state["withdraw_state"] == "in_progress":
             return "withdraw_in_progress"
 
@@ -966,8 +1001,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
 
 def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[float],
                       spot_price: Optional[float], price_source: Optional[str],
-                      price_is_fresh: bool = True,
-                      twap_price: Optional[float] = None) -> Dict[str, Any]:
+                      price_is_fresh: bool = True) -> Dict[str, Any]:
     opens = state["market_opens"]
     prev_ws = state.get("last_window_start")
 
@@ -988,15 +1022,13 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    effective_open = twap_price or current_price
-    if (win["chainlink"] is None and effective_open and price_is_fresh
+    if (win["chainlink"] is None and current_price and price_is_fresh
             and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
-        win["chainlink"] = effective_open
+        win["chainlink"] = current_price
         win["binance"] = spot_price
         win["genuine"] = True
-        src_tag = f"TWAP({price_source})" if twap_price else price_source
-        log_message(f"Window open marked @ eventStartTime: Chainlink {effective_open:.2f} "
-                    f"({src_tag}) / Binance {spot_price if spot_price else '-'}")
+        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
+                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
     state["last_window_start"] = start_ms
     return win
 
@@ -1316,8 +1348,6 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "withdraw_in_progress"
     if not ctx:
         return "no_context"
-    if bool(state["active_trades"]) or bool(_in_flight_markets):
-        return "slot_busy"
     if ctx.get("slot_busy"):
         return "slot_busy"
     if not ctx.get("price_is_fresh"):
@@ -1352,13 +1382,7 @@ async def evaluate_entry(reason: str = "event"):
         if not spot_price:
             return
 
-        end_ts = ctx.get("end_ts")
-        if end_ts and end_ts > now:
-            dynamic_time_left_min = (end_ts - now) / 60.0
-        else:
-            dynamic_time_left_min = ctx.get("time_left_min", 15.0)
-
-        mc_steps = max(1, math.ceil(dynamic_time_left_min / 5))
+        mc_steps = max(1, math.ceil(ctx["time_left_min"] / 5))
         fair_up = indicators.fair_prob_up(
             spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"]
         )
@@ -1528,11 +1552,10 @@ async def update_loop():
                 event_start_ms = int(timing["startMs"])
 
             start_ms = event_start_ms
-            cl_twap = poly_ws.get("twap") or cl_ws.get("twap")
-            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh, twap_price=cl_twap)
+            win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh)
 
             strike_open = win["chainlink"]
-            strike_source = "chainlink_twap" if (win.get("genuine") and cl_twap) else "chainlink_ws"
+            strike_source = "chainlink_ws"
 
             model_open = None
             for c in reversed(klines_5m):
@@ -1642,7 +1665,7 @@ async def update_loop():
                     "slot_busy": bool(state["active_trades"]),
                 }
 
-            current_prices_dict = {"spot": spot_price, "chainlink": current_price, "chainlink_twap": cl_twap}
+            current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
             if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
@@ -2359,5 +2382,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8050))
+    port = int(os.getenv("PORT", 8083))
     uvicorn.run(app, host="0.0.0.0", port=port)
