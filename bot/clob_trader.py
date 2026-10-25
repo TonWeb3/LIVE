@@ -491,21 +491,24 @@ class ClobTrader:
                 size_matched = float(direct.get("size_matched") or 0.0)
                 original_size = float(direct.get("original_size") or 0.0)
                 price = float(direct.get("price") or 0.0)
-                if status_raw in ("MATCHED", "FILLED") or (original_size > 0 and size_matched >= original_size) or size_matched > 0:
+                if status_raw in ("MATCHED", "FILLED") or (original_size > 0 and size_matched >= original_size):
                     return {"status": "FILLED", "size_matched": size_matched if size_matched > 0 else original_size, "price": price}
                 elif status_raw in ("CANCELLED", "CANCELED"):
                     return {"status": "CANCELLED", "size_matched": size_matched}
+                elif size_matched > 0:
+                    return {"status": "OPEN", "size_matched": size_matched, "original_size": original_size, "price": price, "partial": True}
 
-            # 3. Check recent trades for this order
-            trades = self.clob.get_trades()
-            if trades:
-                for t in trades[:10]:
-                    td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
-                    if str(td.get("taker_order_id") or "") == str(order_id) or str(order_id) in str(td.get("maker_orders") or []):
-                        return {"status": "FILLED", "size_matched": float(td.get("size") or 0.0), "price": float(td.get("price") or 0.0)}
+            # 3. Check actual executed trade fills on the CLOB (summing all partial pieces)
+            fills = self.get_order_fills(str(order_id))
+            if fills:
+                total_shares = sum(float(f["size"]) for f in fills)
+                total_usd = sum(float(f["size"]) * float(f["price"]) for f in fills)
+                avg_price = total_usd / total_shares if total_shares > 0 else 0.0
+                return {"status": "FILLED", "size_matched": total_shares, "price": avg_price}
 
-            # If not in open orders and not matched, it was closed/cancelled
-            return {"status": "CLOSED"}
+            # IMPORTANT: Newly placed orders take 1-3 seconds to appear in indexer endpoints.
+            # Do NOT assume CLOSED on empty/unindexed queries; return OPEN (pending propagation).
+            return {"status": "OPEN", "pending": True}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -525,6 +528,76 @@ class ClobTrader:
         return {"trade_id": d.get("trade_id"), "side": d.get("side"),
                 "price": _to_float(d.get("price")), "size": _to_float(d.get("size")),
                 "status": d.get("status"), "match_time": d.get("match_time")}
+
+    def get_order_fills(self, order_id: str, token_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Find all executed fills (including multi-piece fills) matching an order_id."""
+        if not order_id or not self.ensure_ready() or not self.clob:
+            return []
+        try:
+            trades = self.clob.get_trades(token_id=str(token_id)) if token_id else self.clob.get_trades()
+            if not trades:
+                return []
+            target = str(order_id).lower()
+            matching_fills = []
+            for t in trades[:50]:
+                td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                taker_id = str(td.get("taker_order_id") or "").lower()
+                maker_orders = td.get("maker_orders") or []
+
+                if taker_id == target:
+                    matching_fills.append({
+                        "size": float(td.get("size") or 0.0),
+                        "price": float(td.get("price") or 0.0),
+                        "side": td.get("side"),
+                        "match_time": td.get("match_time")
+                    })
+                    continue
+
+                for m in maker_orders:
+                    md = m.model_dump() if hasattr(m, "model_dump") else dict(m)
+                    if str(md.get("order_id") or "").lower() == target:
+                        matching_fills.append({
+                            "size": float(md.get("matched_amount") or td.get("size") or 0.0),
+                            "price": float(md.get("price") or td.get("price") or 0.0),
+                            "side": td.get("side"),
+                            "match_time": td.get("match_time")
+                        })
+            return matching_fills
+        except Exception:
+            return []
+
+    def get_token_fills_in_window(self, token_id: str, start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
+        """Find fills for a token that occurred within a given timestamp window."""
+        if not token_id or not self.ensure_ready() or not self.clob:
+            return []
+        try:
+            trades = self.clob.get_trades(token_id=str(token_id))
+            if not trades:
+                return []
+            matching = []
+            for t in trades[:30]:
+                td = t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                mt = td.get("match_time")
+                trade_ts = None
+                if mt:
+                    try:
+                        if isinstance(mt, (int, float)):
+                            trade_ts = float(mt) if mt < 1e11 else float(mt) / 1000.0
+                        else:
+                            trade_ts = datetime.fromisoformat(str(mt).replace('Z', '+00:00')).timestamp()
+                    except Exception:
+                        pass
+
+                if trade_ts is None or (start_ts - 60 <= trade_ts <= end_ts + 60):
+                    matching.append({
+                        "size": float(td.get("size") or 0.0),
+                        "price": float(td.get("price") or 0.0),
+                        "side": td.get("side"),
+                        "trade_id": td.get("trade_id")
+                    })
+            return matching
+        except Exception:
+            return []
 
     # ── redemption ──────────────────────────────────────────────────────────────
     def enable_auto_redeem(self) -> Dict[str, Any]:
