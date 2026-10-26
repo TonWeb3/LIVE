@@ -292,6 +292,10 @@ class ClobTrader:
         self.ready = True
         self.last_error = None
 
+    def is_ready(self) -> bool:
+        """Check if CLOB client is initialized and ready without triggering blocking setup."""
+        return bool(self.ready and self.clob is not None)
+
     def ensure_ready(self) -> bool:
         if self.ready and self.clob is not None:
             return True
