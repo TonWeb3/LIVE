@@ -239,10 +239,10 @@
                                             <span x-show="trade.live_status === 'NO_CREDS'" class="text-gray-500 text-xs">No Key</span>
                                             <span x-show="trade.live_status !== 'FILLED' && trade.live_status !== 'GTD_OPEN' && trade.live_status !== 'FILLING' && trade.live_status !== 'NO_CREDS'" class="text-gray-500 text-xs" x-text="trade.live_status || '—'"></span>
                                         </td>
-                                        <td class="px-4 py-3 font-mono" x-text="(trade.live_status === 'FILLED' && trade.live_shares != null) ? trade.live_shares.toFixed(2) : '—'"></td>
+                                        <td class="px-4 py-3 font-mono" x-text="(trade.live_status === 'FILLED') ? formatShares(trade.live_shares) : '—'"></td>
                                         <td class="px-4 py-3 font-mono font-bold"
-                                            :class="(trade.live_status === 'FILLED' && trade.live_unrealized_pl != null) ? (trade.live_unrealized_pl >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-500'"
-                                            x-text="(trade.live_status === 'FILLED' && trade.live_unrealized_pl != null) ? ((trade.live_unrealized_pl >= 0 ? '+$' : '-$') + Math.abs(trade.live_unrealized_pl).toFixed(2)) : '—'"></td>
+                                            :class="(trade.live_status === 'FILLED' && trade.live_unrealized_pl != null) ? (Number(trade.live_unrealized_pl) >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-500'"
+                                            x-text="(trade.live_status === 'FILLED') ? formatUsd(trade.live_unrealized_pl) : '—'"></td>
                                         <td class="px-4 py-3 text-[10px] space-y-0.5">
                                             <div class="flex items-center gap-1.5">
                                                 <span class="text-gray-500 font-bold uppercase text-[9px]">Paper:</span>
@@ -301,18 +301,18 @@
                                         <td class="px-4 py-3 truncate max-w-[150px] sm:max-w-[180px]" x-text="trade.market_slug"></td>
                                         <td class="px-4 py-3 font-bold" :class="trade.side === 'UP' ? 'text-green-400' : 'text-red-400'" x-text="trade.side"></td>
                                         <td class="px-4 py-3 font-mono text-gray-300">
-                                            <span x-text="trade.paper_entry_price != null ? ((trade.paper_entry_price * 100).toFixed(0) + '¢') : ((trade.entry_price * 100).toFixed(0) + '¢')"></span>
+                                            <span x-text="formatCents(trade.paper_entry_price != null ? trade.paper_entry_price : trade.entry_price)"></span>
                                             <span class="text-gray-500">/</span>
                                             <span :class="trade.live_entry_price != null ? 'text-emerald-400 font-bold' : 'text-gray-500'"
-                                                  x-text="trade.live_entry_price != null ? ((trade.live_entry_price * 100).toFixed(0) + '¢') : '—'"></span>
+                                                  x-text="formatCents(trade.live_entry_price)"></span>
                                         </td>
                                         <td class="px-4 py-3 font-mono font-bold"
                                             :class="trade.exit_reason === 'flip' ? 'text-orange-400' : ((trade.status === 'VOID' || trade.exit_reason === 'void') ? 'text-gray-500' : 'text-teal-400')"
                                             x-text="trade.exit_reason ? trade.exit_reason.toUpperCase() : (trade.status === 'VOID' ? 'VOID' : 'SETTLED')"></td>
                                         <td class="px-4 py-3 font-bold font-mono">
                                             <span x-show="trade.live_profit_loss != null"
-                                                  :class="trade.live_profit_loss > 0 ? 'text-green-400' : (trade.live_profit_loss < 0 ? 'text-red-400' : 'text-gray-400')"
-                                                  x-text="trade.live_profit_loss != null ? ((trade.live_profit_loss >= 0 ? '+$' : '-$') + Math.abs(trade.live_profit_loss).toFixed(2)) : ''"></span>
+                                                  :class="Number(trade.live_profit_loss) > 0 ? 'text-green-400' : (Number(trade.live_profit_loss) < 0 ? 'text-red-400' : 'text-gray-400')"
+                                                  x-text="formatUsd(trade.live_profit_loss)"></span>
                                             <span x-show="trade.live_profit_loss == null" class="text-gray-500">—</span>
                                         </td>
                                         <td class="px-4 py-3 text-[10px] space-y-0.5 whitespace-nowrap">
@@ -416,14 +416,14 @@
                 live: false,          // true while the push socket is connected
                 lastLogSeq: -1,
                 wsRetry: 0,
+                lastMessageTs: 0,
 
                 init() {
                     this.refresh();          // paint immediately, don't wait for the socket
                     this.loadFiles();
                     this.connectWs();
-                    // Polling is now a FALLBACK, not the normal path: it only runs while
-                    // the push socket is down, so the two never fight over the snapshot.
-                    setInterval(() => { if (!this.live) this.refresh(); }, 1000);
+                    // Polling runs when disconnected OR when socket hasn't pushed a tick for >2.5s
+                    setInterval(() => { if (!this.live || (Date.now() - this.lastMessageTs > 2500)) this.refresh(); }, 1000);
                     setInterval(() => { if (!this.live) this.refreshLogs(); }, 2000);
                     // File sizes/rows grow slowly - a 30s refresh is plenty.
                     setInterval(() => { if (this.tab === 'logs') this.loadFiles(); }, 30000);
@@ -437,8 +437,9 @@
                         ws = new WebSocket(proto + '//' + location.host + '/ws');
                     } catch (e) { this.scheduleReconnect(); return; }
 
-                    ws.onopen = () => { this.live = true; this.wsRetry = 0; };
+                    ws.onopen = () => { this.live = true; this.wsRetry = 0; this.lastMessageTs = Date.now(); };
                     ws.onmessage = (ev) => {
+                        this.lastMessageTs = Date.now();
                         try { this.applySnapshot(JSON.parse(ev.data)); }
                         catch (e) { /* ignore a malformed frame; the next one corrects it */ }
                     };
@@ -599,6 +600,23 @@
                     const m = Math.floor(totalSecs / 60);
                     const s = totalSecs % 60;
                     return m.toString().padStart(2, '0') + ':' + s.toString().padStart(2, '0');
+                },
+                formatShares(val) {
+                    if (val == null || val === '') return '—';
+                    const n = Number(val);
+                    return isNaN(n) ? String(val) : n.toFixed(2);
+                },
+                formatUsd(val) {
+                    if (val == null || val === '') return '—';
+                    const n = Number(val);
+                    if (isNaN(n)) return '—';
+                    return (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(2);
+                },
+                formatCents(val) {
+                    if (val == null || val === '') return '—';
+                    const n = Number(val);
+                    if (isNaN(n)) return '—';
+                    return (n * 100).toFixed(0) + '¢';
                 },
                 formatTimeOnly(iso) {
                     if (!iso) return '—';

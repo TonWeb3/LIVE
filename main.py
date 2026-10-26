@@ -56,13 +56,17 @@ def _sync_active_trades_to_latest_data():
     if "trading_state" in state.get("latest_data", {}):
         ts = state["latest_data"]["trading_state"]
         ts["active_trades"] = list(state["active_trades"])
-        live_open_val = sum(
-            float(t.get("live_shares", 0.0) or 0.0) * (float(t.get("live_mark_price") or t.get("live_entry_price") or 0.0))
-            for t in state["active_trades"]
-            if t.get("live_status") == "FILLED" and t.get("live_shares")
-        )
+        live_open_val = 0.0
+        for t in state["active_trades"]:
+            if t.get("live_status") == "FILLED" and t.get("live_shares"):
+                try:
+                    s = float(t.get("live_shares") or 0.0)
+                    p = float(t.get("live_mark_price") or t.get("live_entry_price") or 0.0)
+                    live_open_val += s * p
+                except (ValueError, TypeError):
+                    pass
         ts["open_value"] = live_open_val
-        live_bal = state.get("live_balance") or 0.0
+        live_bal = float(state.get("live_balance") or 0.0)
         ts["equity"] = live_bal + live_open_val
         ts["balance"] = live_bal
         ts["has_live_creds"] = bool(settings.PRIVATE_KEY)
@@ -325,15 +329,29 @@ async def telegram_poller():
         await asyncio.sleep(2)
 
 # ── Live PnL and State WebSocket broadcast ────────────────────────────────────
+def _json_default(obj):
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    if hasattr(obj, "hex"):
+        return obj.hex()
+    if isinstance(obj, set):
+        return list(obj)
+    return str(obj)
+
 async def broadcast_state():
     if not _ws_clients:
         return
-    msg = json.dumps({
-        "type": "state_update",
-        "data": state["latest_data"],
-        "logs": state["logs"][-20:],
-        "log_seq": state["log_seq"],
-    })
+    try:
+        msg = json.dumps({
+            "type": "state_update",
+            "data": state.get("latest_data") or {},
+            "logs": state.get("logs", [])[-20:],
+            "log_seq": state.get("log_seq", 0),
+        }, default=_json_default)
+    except Exception as e:
+        print(f"broadcast_state json serialization error: {e}")
+        return
+
     dead = set()
     for ws in list(_ws_clients):
         try:
@@ -419,7 +437,23 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         _cached_market = market
         _cached_market_ts = now
         _cached_market_series = curr_target
-    return _cached_market
+        return market
+
+    # If discovery returned nothing, verify if existing cached market is still unexpired
+    if _cached_market:
+        end_date = _cached_market.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
+                if end_ts > now:
+                    return _cached_market
+            except Exception:
+                pass
+        # Expired or invalid cache: purge it so we don't pin to a dead market!
+        _cached_market = None
+        _cached_market_ts = 0.0
+
+    return None
 
 async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     market = await get_active_market()
@@ -617,7 +651,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
 
     log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous GTD fill loop initiated")
     retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
-    max_attempts = 2
+    max_attempts = 3
 
     try:
         while trade["status"] == "OPEN" and trade.get("live_status") == "FILLING":
@@ -1739,10 +1773,17 @@ async def update_loop():
             }
 
             settlement_ms = None
-            if poly_snapshot["ok"] and poly_snapshot["market"].get("endDate"):
-                settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
+            if poly_snapshot.get("ok") and poly_snapshot.get("market") and poly_snapshot["market"].get("endDate"):
+                try:
+                    settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
+                except Exception:
+                    settlement_ms = None
 
-            time_left_min = (settlement_ms - time.time() * 1000) / 60_000 if settlement_ms else timing["remainingMinutes"]
+            now_ms = time.time() * 1000
+            if settlement_ms and settlement_ms > now_ms:
+                time_left_min = (settlement_ms - now_ms) / 60_000
+            else:
+                time_left_min = max(0.0, timing["remainingMinutes"])
 
             closes = [c["close"] for c in klines_1m]
             rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
@@ -1853,34 +1894,50 @@ async def update_loop():
             live_open_value = 0.0
             for t in state["active_trades"]:
                 mark = None
-                if poly_snapshot["ok"] and str(t.get("market_id")) == str(poly_snapshot["market"].get("id")):
-                    ob = (poly_snapshot.get("orderbook") or {}).get("up" if t["side"] == "UP" else "down") or {}
-                    mark = ob.get("bestBid") or (market_up if t["side"] == "UP" else market_down)
+                if poly_snapshot.get("ok") and poly_snapshot.get("market") and str(t.get("market_id")) == str(poly_snapshot["market"].get("id")):
+                    ob = (poly_snapshot.get("orderbook") or {}).get("up" if t.get("side") == "UP" else "down") or {}
+                    raw_mark = ob.get("bestBid") or (market_up if t.get("side") == "UP" else market_down)
+                    try:
+                        mark = float(raw_mark) if raw_mark is not None else None
+                    except (ValueError, TypeError):
+                        mark = None
 
                 if t.get("live_status") == "FILLED" and t.get("live_shares"):
-                    if mark:
+                    try:
+                        shares = float(t.get("live_shares") or 0.0)
+                        entry_px = float(t.get("live_entry_price") or 0.0)
+                        amt = float(t.get("live_amount") if t.get("live_amount") is not None else (shares * entry_px))
+                    except (ValueError, TypeError):
+                        shares = 0.0
+                        amt = 0.0
+
+                    if mark is not None and shares > 0:
                         t["live_mark_price"] = mark
-                        t["live_unrealized_pl"] = (t["live_shares"] * mark) - t["live_amount"]
-                        live_open_value += t["live_shares"] * mark
+                        t["live_unrealized_pl"] = (shares * mark) - amt
+                        live_open_value += shares * mark
                     else:
+                        t["live_mark_price"] = mark
                         t["live_unrealized_pl"] = None
-                        live_open_value += t["live_amount"]
+                        live_open_value += amt
                 else:
                     t["live_mark_price"] = None
                     t["live_unrealized_pl"] = None
 
             # Live balance maintained with 0ms delay by background live_balance_updater
-            live_balance = state.get("live_balance") or 0.0
+            live_balance = float(state.get("live_balance") or 0.0)
             total_equity = live_balance + live_open_value
             await maybe_auto_withdraw(total_equity, poly_snapshot)
 
             signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
-            utils.append_csv_row(SIGNALS_PATH, csv_header, [
-                datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
-                signal_label, fair_up, 1 - fair_up, market_up, market_down,
-                edge["edgeUp"], edge["edgeDown"], f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
-                decision.get("reason", ""), exec_result or ""
-            ])
+            try:
+                utils.append_csv_row(SIGNALS_PATH, csv_header, [
+                    datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
+                    signal_label, fair_up, 1 - fair_up, market_up, market_down,
+                    edge["edgeUp"], edge["edgeDown"], f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
+                    decision.get("reason", ""), exec_result or ""
+                ])
+            except Exception:
+                pass
 
             state["latest_data"] = {
                 "timestamp": datetime.now().isoformat(),
@@ -2543,5 +2600,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8050))
+    port = int(os.getenv("PORT", 8083))
     uvicorn.run(app, host="0.0.0.0", port=port)
