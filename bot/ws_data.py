@@ -25,8 +25,8 @@ except ImportError:
 
 class BinanceTradeStream:
     """Ultra-fast spot + futures leading price feed from Binance.
-    Listens to Binance Futures (@bookTicker and @trade) which leads spot price discovery
-    by 30ms-80ms, with seamless fallback/redundancy to Binance Spot (@trade)."""
+    Listens to Binance Spot (@bookTicker and @trade). Computes real-time mid-price
+    from best bid and ask on every order book change with zero basis skew."""
     def __init__(self, symbol: str, on_update: Optional[Callable] = None):
         self.symbol = symbol.lower()
         self.on_update = on_update
@@ -35,20 +35,22 @@ class BinanceTradeStream:
         self.last_source = None
         self.closed = False
 
-    async def _futures_worker(self):
-        """Binance USDT-M Futures feed (@bookTicker) — the leading edge signal.
-        The mid-price of best bid and ask updates before spot trades print."""
+    async def _spot_book_worker(self):
+        """Binance Spot feed (@bookTicker) — fast mid-price on Spot index.
+        The mid-price of best bid and ask updates on every book change with zero basis skew."""
         endpoints = [
-            f"wss://fstream.binance.com/ws/{self.symbol}@bookTicker",
-            f"wss://fstream.binance.com/ws/{self.symbol}@trade"
+            f"wss://stream.binance.com:9443/ws/{self.symbol}@bookTicker",
+            f"wss://data-stream.binance.vision/ws/{self.symbol}@bookTicker"
         ]
-        url = endpoints[0]
+        endpoint_idx = 0
         while not self.closed:
+            url = endpoints[endpoint_idx % len(endpoints)]
+            endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
-                        print(f"Connected to Binance Futures Lead WS: {self.symbol}@bookTicker")
+                        print(f"Connected to Binance Spot Book WS ({url}): {self.symbol}@bookTicker")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -60,14 +62,7 @@ class BinanceTradeStream:
                                         ask = float(data_msg["a"])
                                         if bid > 0 and ask > 0:
                                             mid = (bid + ask) / 2.0
-                                            self._process_trade(mid, source="binance_futures_book")
-                                    except (TypeError, ValueError):
-                                        pass
-                                elif "p" in data_msg:
-                                    try:
-                                        p = float(data_msg["p"])
-                                        if p > 0:
-                                            self._process_trade(p, source="binance_futures_trade")
+                                            self._process_trade(mid, source="binance_spot_book")
                                     except (TypeError, ValueError):
                                         pass
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -111,7 +106,7 @@ class BinanceTradeStream:
     async def start(self):
         # Run both Futures (leading edge) and Spot (redundancy) concurrently
         await asyncio.gather(
-            self._futures_worker(),
+            self._spot_book_worker(),
             self._spot_worker(),
             return_exceptions=True
         )
