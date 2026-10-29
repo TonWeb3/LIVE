@@ -915,9 +915,8 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         ask_liq_shares = ob.get("askLiquidity")
         if ask_liq_shares is not None and price > 0:
             ask_liq_usd = ask_liq_shares * price
-            min_needed = max(1.0, min(paper_amount, 5.0))
-            if ask_liq_usd < min_needed and ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
-                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity < ${min_needed:.2f} needed)")
+            if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
+                log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
                 return "thin_book"
             paper_amount = min(paper_amount, ask_liq_usd)
 
@@ -1740,27 +1739,8 @@ async def update_loop():
                     break
                 if c["openTime"] < start_ms:
                     break
-            if not model_open:
-                for c in reversed(klines_1m):
-                    if c["openTime"] == start_ms:
-                        model_open = c["open"]
-                        break
-                    if c["openTime"] < start_ms:
-                        break
             model_open = model_open or win.get("binance")
-
-            # Zero-Miss Window Backfill:
-            # If the bot started mid-window or missed the first 20s mark,
-            # backfill strike_open from historical klines at window open timestamp
-            if strike_open is None and model_open:
-                strike_open = model_open
-                strike_source = "kline_open_backfill"
-                win["chainlink"] = model_open
-                win["binance"] = model_open
-                win["genuine"] = True
-                log_message(f"Window open backfilled from klines @ eventStartTime: {strike_open:.2f} (mid-window start)")
-
-            target_open = model_open or strike_open
+            target_open = model_open if strike_open is not None else None
 
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
             fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
@@ -2600,5 +2580,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8083))
+    port = int(os.getenv("PORT", 8050))
     uvicorn.run(app, host="0.0.0.0", port=port)

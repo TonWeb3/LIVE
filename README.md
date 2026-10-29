@@ -55,18 +55,18 @@ All of these are also editable live on the **Settings** page.
 ### 3) Run
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8083
+uvicorn main:app --host 0.0.0.0 --port 8050
 # or simply:
 python main.py
 ```
 
-Access the dashboard at `http://localhost:8083`.
+Access the dashboard at `http://localhost:8050`.
 
 ## Docker
 
 ```bash
 docker build -t polymarket-assistant-gtd .
-docker run -p 8083:8083 polymarket-assistant-gtd
+docker run -p 8050:8050 polymarket-assistant-gtd
 ```
 
 ## Deployment on Render
@@ -81,7 +81,7 @@ The repository includes a `render.yaml`. When creating a new blueprint on Render
 2. Under **Runtime**, explicitly select **Python 3**.
 3. Set the following commands:
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8083`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8050`
 4. Add any necessary environment variables (optional).
 
 ## Live Trading
