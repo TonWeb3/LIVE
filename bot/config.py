@@ -15,14 +15,14 @@ class Settings(BaseSettings):
 
     # ── Copy-trader continuous GTD execution ───────────────────────────────────
     COPY_RETRY_INTERVAL_MS: int = 300
-    COPY_MIN_REMAINING_S: float = 30.0
+    COPY_MAX_RETRIES: int = 5
 
     # ── Live trading (Polymarket CLOB V2) ───────────────────────────────────────
     # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
     # auto-detected: deposit-wallet (V2, signature_type 3) first, then legacy proxy /
     # safe — whichever actually holds pUSD. Nothing to pick by hand.
     CLOB_MAX_SLIPPAGE: float = 0.05  # marketable-limit buffer above the quote (probability units, 5¢)
-    EXIT_MAX_RETRIES: int = 3
+    EXIT_MAX_RETRIES: int = 5
     CLOB_ALLOW_PARTIAL_FILL: bool = True  # Allow partial fill for thin books
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
     ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
@@ -143,7 +143,7 @@ def load_settings():
             if "copy_trader" in config_data:
                 ct = config_data["copy_trader"]
                 if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
-                if "min_remaining_seconds" in ct: base_settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
+                if "max_retries" in ct: base_settings.COPY_MAX_RETRIES = int(ct["max_retries"])
 
             if "relayer" in config_data:
                 rl = config_data["relayer"]

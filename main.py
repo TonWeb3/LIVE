@@ -586,13 +586,25 @@ async def handle_order_gone_quiet(order_id: str, trade: Dict[str, Any], token_id
     """
     side = trade.get("side", "UNKNOWN")
     # 1. Never assume. Cancel explicitly by ID.
+    cancel_success = False
     try:
-        await asyncio.to_thread(clob_trader.cancel_order, order_id)
+        c_res = await asyncio.to_thread(clob_trader.cancel_order, order_id)
+        cancel_success = bool(c_res and c_res.get("ok"))
     except Exception as e:
         log_message(f"cancel {order_id} failed: {e}")
 
     # Brief buffer for indexer to catch any matching engine fills
     await asyncio.sleep(0.5)
+
+    # Double-check: if cancel call failed or unconfirmed, ensure emergency cancel
+    if not cancel_success:
+        try:
+            ord_check = await asyncio.to_thread(clob_trader.check_order_status, order_id)
+            if ord_check.get("status") == "OPEN":
+                log_message(f"Warning: order {order_id} still open on book; sending emergency cancel_order")
+                await asyncio.to_thread(clob_trader.cancel_order, order_id)
+        except Exception:
+            pass
 
     # 2. Check what actually happened to THIS order (sum all partial fills).
     fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
@@ -636,7 +648,7 @@ async def handle_order_gone_quiet(order_id: str, trade: Dict[str, Any], token_id
         await broadcast_state()
         return False
 
-async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, Any], token_ids: Dict[str, Any], evaluated_price: Optional[float] = None):
+async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, Any], token_ids: Dict[str, Any], evaluated_price: Optional[float] = None, ask_liq_usd: Optional[float] = None):
     token_id = trade.get("token_id")
     side = trade.get("side")
     cur_mkt_id = str(market.get("id") or "")
@@ -651,15 +663,15 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
 
     log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous GTD fill loop initiated")
     retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
-    max_attempts = 3
+    max_attempts = int(getattr(settings, "COPY_MAX_RETRIES", 5) or 5)
 
     try:
         while trade["status"] == "OPEN" and trade.get("live_status") == "FILLING":
             now_ts = time.time()
             # 1. Check if window is close to expiry (<15s)
-            if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
+            if trade.get("end_ts") and now_ts >= trade["end_ts"]:
                 trade["live_status"] = "TIMEOUT"
-                log_message(f"LIVE copy stopped for {trade['market_slug']}: window close to expiry (<{settings.COPY_MIN_REMAINING_S}s)")
+                log_message(f"LIVE copy stopped for {trade['market_slug']}: window expired")
                 await asyncio.to_thread(save_state)
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
@@ -679,11 +691,14 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             # 2. Get freshest book ask for this token (attempt #1 uses evaluated_price instantly with 0ms RAM lookup)
             if attempt_num == 1 and evaluated_price and evaluated_price > 0:
                 current_ask = evaluated_price
+                cur_ask_liq_usd = ask_liq_usd
             else:
                 summary = polymarket_clob_ws.get_summary(token_id, max_age_s=3.0)
                 current_ask = summary.get("bestAsk") if summary else None
                 if not current_ask or current_ask <= 0:
                     current_ask = evaluated_price or trade.get("paper_entry_price") or 0.50
+                ask_liq_sh = summary.get("askLiquidity") if summary else None
+                cur_ask_liq_usd = (ask_liq_sh * current_ask) if (ask_liq_sh is not None and current_ask > 0) else ask_liq_usd
 
             # 3. Sizing: Instant RAM lookup of precomputed stake from background updater (0ms latency)
             live_balance = state.get("live_balance") or 0.0
@@ -701,6 +716,9 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 live_amount = max(1.0, min(live_amount, live_balance)) if live_balance >= 1.0 else 0.0
                 state["precomputed_live_stake"] = round(live_amount, 2)
 
+            if cur_ask_liq_usd is not None and cur_ask_liq_usd > 0 and live_amount > 0:
+                live_amount = max(1.0, round(min(live_amount, cur_ask_liq_usd), 2)) if live_balance >= 1.0 else 0.0
+
             if live_balance < 1.0 or live_amount < 1.0:
                 trade["live_status"] = "INSUFFICIENT_FUNDS"
                 log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < $1.00 minimum)")
@@ -713,8 +731,9 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             extra_slip = min(0.08, (attempt_num - 1) * 0.015)
             gtd_price = min(0.99, round(current_ask + settings.CLOB_MAX_SLIPPAGE + extra_slip, 4))
             safe_usd = max(1.00, live_amount)
-            # Guarantee shares * price >= 1.00 (Polymarket min order size rule)
-            gtd_shares = math.ceil((safe_usd / gtd_price) * 100.0) / 100.0
+            # Guarantee shares >= 5.0 and shares * price >= 1.00 (Polymarket min order size rule: min 5 shares)
+            min_shares = 5.0
+            gtd_shares = max(min_shares, math.ceil((safe_usd / gtd_price) * 100.0) / 100.0)
             while round(gtd_shares * gtd_price, 4) < 1.00:
                 gtd_shares = round(gtd_shares + 0.01, 2)
 
@@ -741,8 +760,8 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 # Monitor GTD order until filled, window expires (<15s), or 4s re-quote timeout
                 while trade["status"] == "OPEN" and trade.get("live_status") == "GTD_OPEN":
                     now_ts = time.time()
-                    if trade.get("end_ts") and (trade["end_ts"] - now_ts) < settings.COPY_MIN_REMAINING_S:
-                        log_message(f"Cancelling resting GTD order {order_id}: window near expiry (<{settings.COPY_MIN_REMAINING_S}s)")
+                    if trade.get("end_ts") and now_ts >= trade["end_ts"]:
+                        log_message(f"Cancelling resting GTD order {order_id}: window expired")
                         filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         if not filled:
                             trade["live_status"] = "TIMEOUT"
@@ -902,6 +921,8 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
         # Internal paper balance risk sizing
         balance = state["paper_balance"]
+        if balance <= 0 and settings.PRIVATE_KEY:
+            balance = state["paper_balance"] = float(settings.PAPER_BALANCE_USD or 1000.0)
         risk_type = (settings.RISK_TYPE or "percent").lower()
         if risk_type == "fixed":
             paper_amount = float(settings.RISK_VALUE)
@@ -913,12 +934,16 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
         ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
         ask_liq_shares = ob.get("askLiquidity")
+        ask_liq_usd = None
         if ask_liq_shares is not None and price > 0:
             ask_liq_usd = ask_liq_shares * price
             if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
                 log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
                 return "thin_book"
             paper_amount = min(paper_amount, ask_liq_usd)
+
+        if settings.PRIVATE_KEY and balance < paper_amount and balance > 0:
+            paper_amount = balance
 
         if balance < paper_amount or paper_amount <= 0:
             print(f"Insufficient internal paper balance ({balance})")
@@ -1005,7 +1030,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
                 # Fire LIVE trade order and paper background tasks concurrently via asyncio.gather
                 trade_dispatched = True
                 asyncio.create_task(asyncio.gather(
-                    _continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price),
+                    _continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price, ask_liq_usd=ask_liq_usd),
                     _bg_paper_post_actions()
                 ))
             else:
@@ -1194,6 +1219,13 @@ async def update_trades(current_prices: Dict[str, Any]):
                 end_ts = now_ts
         expired = now_ts >= end_ts
         trade["awaiting_resolution"] = expired and trade.get("status") == "OPEN"
+
+        # Hard cancel on expiry: Never let a resting order bleed into the next window!
+        if expired and trade.get("live_order_id") and trade.get("live_status") in ("FILLING", "GTD_OPEN", "GTC_OPEN"):
+            try:
+                await asyncio.to_thread(clob_trader.cancel_order, trade["live_order_id"])
+            except Exception:
+                pass
 
         if expired and trade.get("close_price") is None:
             frozen_close = cur_price or trade.get("last_price")
@@ -1497,6 +1529,8 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "withdraw_in_progress"
     if not ctx:
         return "no_context"
+    if ctx.get("slot_busy"):
+        return "slot_busy"
     _mkt = ctx.get("market") or {}
     _mid = str(_mkt.get("id") or "")
     _mslug = str(_mkt.get("slug") or "")
@@ -1760,8 +1794,9 @@ async def update_loop():
                     settlement_ms = None
 
             now_ms = time.time() * 1000
-            if settlement_ms and settlement_ms > now_ms:
-                time_left_min = (settlement_ms - now_ms) / 60_000
+            if settlement_ms is not None:
+                # If market has a known settlement timestamp, respect it strictly: expired means 0.0 minutes left!
+                time_left_min = max(0.0, (settlement_ms - now_ms) / 60_000)
             else:
                 time_left_min = max(0.0, timing["remainingMinutes"])
 
@@ -2244,7 +2279,7 @@ async def get_settings():
         "private_key": masked_pk,
         "copy_trader": {
             "retry_interval_ms": settings.COPY_RETRY_INTERVAL_MS,
-            "min_remaining_seconds": settings.COPY_MIN_REMAINING_S
+            "max_retries": settings.COPY_MAX_RETRIES
         },
         "live": {
             "relayer_api_key": mask(settings.RELAYER_API_KEY),
@@ -2338,7 +2373,7 @@ async def post_settings(new_settings: Dict[str, Any]):
     if "copy_trader" in new_settings:
         ct = new_settings["copy_trader"]
         if "retry_interval_ms" in ct: settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
-        if "min_remaining_seconds" in ct: settings.COPY_MIN_REMAINING_S = float(ct["min_remaining_seconds"])
+        if "max_retries" in ct: settings.COPY_MAX_RETRIES = int(ct["max_retries"])
 
     if "trading" in new_settings:
         t = new_settings["trading"]

@@ -18,6 +18,7 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 """
 
 import threading
+from datetime import datetime
 import time
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
@@ -132,6 +133,53 @@ _patch_order_builder()
 _patch_crypto_signing()
 
 
+def _ensure_rust_clob():
+    """Ensure the native Rust `rust_clob` extension is compiled and imported for the
+    current OS/CPU architecture. If not yet installed in site-packages, automatically
+    bootstraps the Rust toolchain (if needed) and builds `./rust_clob` via pip."""
+    try:
+        import rust_clob
+        return rust_clob
+    except ImportError:
+        import os
+        import sys
+        import shutil
+        import subprocess
+
+        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        crate_dir = os.path.join(proj_root, "rust_clob")
+        if not os.path.isdir(crate_dir):
+            raise RuntimeError(f"Missing rust_clob crate directory at {crate_dir}")
+
+        env = os.environ.copy()
+        cargo_bin = os.path.expanduser("~/.cargo/bin")
+        if os.path.isdir(cargo_bin) and cargo_bin not in env.get("PATH", ""):
+            env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+
+        if not shutil.which("cargo", path=env.get("PATH")):
+            if os.name != "nt":
+                print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
+                subprocess.run(
+                    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
+                    shell=True,
+                    check=True,
+                    env=env,
+                )
+                env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+            else:
+                raise RuntimeError("Rust toolchain (cargo) not found in PATH.")
+
+        print(f"[rust_clob] Compiling native Rust extension from {crate_dir} ...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", crate_dir],
+            check=True,
+            env=env,
+        )
+        import rust_clob
+        return rust_clob
+
+
+
 
 class ClobTrader:
     _FILLED_STATUSES = ("matched", "delayed")
@@ -149,6 +197,7 @@ class ClobTrader:
         self.last_error: Optional[str] = None
         self._approvals_done = False
         self._api_creds = None
+        self._rust_ready = False
         self._lock = threading.Lock()
 
     def reset(self):
@@ -163,6 +212,7 @@ class ClobTrader:
             self.last_error = None
             self._approvals_done = False
             self._api_creds = None
+            self._rust_ready = False
 
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
@@ -178,25 +228,80 @@ class ClobTrader:
         self._api_creds = c.create_or_derive_api_creds()
         return self._api_creds
 
-    def _new_gasless(self, signature_type: int):
+    def _bind_gasless_funder(self, gasless, signature_type: int, funder: Optional[str]):
+        if not funder:
+            return gasless
+        try:
+            from web3 import Web3
+            chk = Web3.to_checksum_address(funder)
+            gasless.address = chk
+            if signature_type == 3:
+                gasless.get_expected_deposit_wallet = lambda: chk
+                gasless.get_deposit_wallet_address = lambda: chk
+            elif signature_type == 2:
+                gasless.get_safe_proxy_wallet_address = lambda: chk
+                if hasattr(gasless, "safe_abi"):
+                    gasless.safe = gasless._contract(chk, gasless.safe_abi)
+            elif signature_type == 1:
+                gasless.get_poly_proxy_wallet_address = lambda: chk
+        except Exception:
+            pass
+        return gasless
+
+    def _new_gasless(self, signature_type: int, funder: Optional[str] = None):
         # Gasless on-chain client. Two distinct roles:
         #   - relayer key (or builder creds): SUBMITS txs and pays the gas
-        #   - rpc_url: READS chain state (pUSD balance, wallet derivation). Use Alchemy
-        #     when configured, else the library default.
+        #   - rpc_url: READS chain state (pUSD / USDC.e balance, wallet derivation). Use Alchemy
+        #     when configured, else POLYGON_RPC_URL or library default.
         from polymarket_apis.clients.web3_client import PolymarketGaslessWeb3Client
         kwargs = {"private_key": settings.PRIVATE_KEY, "signature_type": signature_type}
         if settings.RELAYER_API_KEY:
             kwargs["relayer_api_key"] = settings.RELAYER_API_KEY
         else:
             kwargs["builder_creds"] = self._derive_creds()
-        if settings.alchemy_rpc_url():
-            kwargs["rpc_url"] = settings.alchemy_rpc_url()
-        return PolymarketGaslessWeb3Client(**kwargs)
+        rpc = settings.alchemy_rpc_url() or getattr(settings, "POLYGON_RPC_URL", "")
+        if rpc:
+            kwargs["rpc_url"] = rpc
+        client = PolymarketGaslessWeb3Client(**kwargs)
+        if funder:
+            self._bind_gasless_funder(client, signature_type, funder)
+        return client
+
+    def _get_onchain_balances(self, gasless, address: str) -> Tuple[float, float]:
+        """Return (pusd_balance, usdc_e_balance) on-chain for `address`."""
+        from web3 import Web3
+        chk = Web3.to_checksum_address(address)
+        pusd_bal = 0.0
+        usdc_e_bal = 0.0
+        try:
+            pusd_bal = float(gasless.get_pusd_balance(address=chk))
+        except Exception:
+            pusd_bal = 0.0
+        try:
+            usdc_e_contract = gasless._contract(gasless.usdc_e_address, gasless.pusd_abi)
+            usdc_e_bal = float(usdc_e_contract.functions.balanceOf(chk).call() / 1e6)
+        except Exception:
+            usdc_e_bal = 0.0
+        return pusd_bal, usdc_e_bal
 
     def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
-        """(signature_type, address) candidates derived from the EOA, deposit-wallet
-        (V2) first, then legacy proxy / safe, and previous active maker address."""
+        """(signature_type, address) candidates derived from the EOA: deposit-wallet
+        (V2, st=3), legacy proxy (st=1), safe (st=2), plus any active maker address."""
         out: List[Tuple[int, str]] = []
+        # 1. Register standard derived wallets first so their true signature_type (3, 1, 2) is preserved
+        for st, getter in (
+            (3, gasless.get_expected_deposit_wallet),
+            (1, gasless.get_poly_proxy_wallet_address),
+            (2, gasless.get_safe_proxy_wallet_address),
+        ):
+            try:
+                addr = getter()
+                if addr and not any(a.lower() == addr.lower() for _, a in out):
+                    out.append((st, addr))
+            except Exception:
+                pass
+
+        # 2. Check previous active maker address from CLOB trades if not already in candidates
         try:
             from polymarket_apis.clients.clob_client import PolymarketClobClient
             from eth_account import Account
@@ -207,54 +312,60 @@ class ClobTrader:
             if trades:
                 first = trades[0]
                 m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
-                if m_addr:
-                    out.append((3, m_addr))
+                if m_addr and not any(a.lower() == m_addr.lower() for _, a in out):
+                    detected_st = None
+                    try:
+                        detected_st = gasless.detect_wallet_signature_type(m_addr)
+                    except Exception:
+                        detected_st = None
+                    st_to_use = detected_st if detected_st in (1, 2, 3) else 3
+                    out.append((st_to_use, m_addr))
         except Exception:
             pass
 
-        for st, getter in (
-            (3, gasless.get_expected_deposit_wallet),
-            (1, gasless.get_poly_proxy_wallet_address),
-            (2, gasless.get_safe_proxy_wallet_address),
-        ):
-            try:
-                addr = getter()
-                if not any(a.lower() == addr.lower() for _, a in out):
-                    out.append((st, addr))
-            except Exception:
-                pass
         return out
 
     def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
-        """Trade from where the money actually is: pick the candidate holding pUSD.
-        Falls back to the deposit wallet when every balance reads 0."""
+        """Trade from where the money actually is: pick the candidate holding pUSD or USDC.e.
+        Falls back to CLOB API balance check and then the deposit wallet when balances read 0."""
+        candidates = self._candidate_wallets(gasless)
+        best = None  # (sig_type, addr, total_onchain_balance)
+        for st, addr in candidates:
+            pusd_bal, usdc_e_bal = self._get_onchain_balances(gasless, addr)
+            total_bal = max(pusd_bal, usdc_e_bal)
+            if best is None or total_bal > best[2]:
+                best = (st, addr, total_bal)
+
+        if best and best[2] > 0:
+            return best[0], best[1]
+
+        # Fallback: check CLOB API collateral balance across candidate signature types & maker address
         try:
             from polymarket_apis.clients.clob_client import PolymarketClobClient
             from eth_account import Account
             eoa = Account.from_key(settings.PRIVATE_KEY).address
-            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=3)
-            c.set_api_creds(self._derive_creds())
-            clob_bal = float(c.get_pusd_balance())
-            if clob_bal > 0:
-                trades = c.get_trades()
-                if trades:
-                    first = trades[0]
-                    m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
-                    if m_addr:
-                        return 3, m_addr
+            creds = self._derive_creds()
+            for st, addr in candidates:
+                try:
+                    c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=addr, chain_id=137, signature_type=st)
+                    c.set_api_creds(creds)
+                    clob_bal = float(c.get_pusd_balance())
+                    if clob_bal > 0:
+                        trades = c.get_trades()
+                        if trades:
+                            first = trades[0]
+                            m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
+                            if m_addr:
+                                for cand_st, cand_addr in candidates:
+                                    if cand_addr.lower() == m_addr.lower():
+                                        return cand_st, cand_addr
+                                return st, m_addr
+                        return st, addr
+                except Exception:
+                    continue
         except Exception:
             pass
 
-        best = None  # (sig_type, addr, balance)
-        for st, addr in self._candidate_wallets(gasless):
-            try:
-                bal = float(gasless.get_pusd_balance(address=addr))
-            except Exception:
-                bal = 0.0
-            if bal > 0:
-                return st, addr
-            if best is None or bal > best[2]:
-                best = (st, addr, bal)
         if best:
             return best[0], best[1]
         return 3, gasless.get_expected_deposit_wallet()
@@ -266,7 +377,8 @@ class ClobTrader:
         probe = self._new_gasless(3)
         sig_type, funder = self._pick_funded_wallet(probe)
 
-        gasless = probe if sig_type == 3 else self._new_gasless(sig_type)
+        gasless = probe if sig_type == 3 else self._new_gasless(sig_type, funder=funder)
+        self._bind_gasless_funder(gasless, sig_type, funder)
 
         clob = PolymarketClobClient(
             private_key=settings.PRIVATE_KEY,
@@ -285,6 +397,22 @@ class ClobTrader:
         except Exception:
             pass
 
+        # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender
+        rust_mod = _ensure_rust_clob()
+        pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
+        creds = clob.creds
+        rust_mod.init_client(
+            str(pk_hex),
+            str(funder),
+            int(sig_type),
+            str(creds.key),
+            str(creds.secret),
+            str(creds.passphrase),
+            str(clob.base_url),
+            137,
+        )
+        self._rust_ready = True
+
         self.gasless = gasless
         self.clob = clob
         self.funder = funder
@@ -294,25 +422,22 @@ class ClobTrader:
 
     def is_ready(self) -> bool:
         """Check if CLOB client is initialized and ready without triggering blocking setup."""
-        return bool(self.ready and self.clob is not None)
+        return bool(self.ready and self.clob is not None and self._rust_ready)
 
     def ensure_ready(self) -> bool:
-        if self.ready and self.clob is not None:
+        if self.ready and self.clob is not None and self._rust_ready:
             return True
         with self._lock:
-            if self.ready and self.clob is not None:
+            if self.ready and self.clob is not None and self._rust_ready:
                 return True
             if not settings.PRIVATE_KEY:
                 self.last_error = "missing_private_key"
                 return False
             try:
                 self._init_clients()
-                # Pre-warm crypto signing context and secp256k1 base point tables
-                try:
-                    import coincurve, os
-                    _ = coincurve.PrivateKey(os.urandom(32)).sign_recoverable(os.urandom(32), hasher=None)
-                except Exception:
-                    pass
+                # Pre-warm native Rust crypto signing context
+                rust_mod = _ensure_rust_clob()
+                _ = rust_mod.build_signed_order("1", 1000000, 1000000, 0, "FAK", "0", False, False, False)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -356,6 +481,55 @@ class ClobTrader:
             pass
 
     # ── orders ──────────────────────────────────────────────────────────────────
+    def _post_order_fast(
+        self,
+        token_id: str,
+        maker_amount: int,
+        taker_amount: int,
+        side_int: int,
+        order_type_str: str,
+        expiration_str: str = "0",
+        neg_risk: bool = False,
+    ) -> Dict[str, Any]:
+        """Sign EIP-712 / Solady ERC-1271 order and POST via native Rust (`rust_clob`),
+        releasing the GIL during network I/O."""
+        import json
+        rust_mod = _ensure_rust_clob()
+        res = rust_mod.post_order(
+            str(token_id),
+            int(maker_amount),
+            int(taker_amount),
+            int(side_int),
+            str(order_type_str),
+            str(expiration_str),
+            bool(neg_risk),
+            False,
+            False,
+        )
+        http_status = int(res.get("http_status") or 0)
+        resp_text = res.get("response_text") or ""
+        if not res.get("ok_http"):
+            err_detail = resp_text
+            try:
+                err_json = json.loads(resp_text) if resp_text else {}
+                if isinstance(err_json, dict):
+                    err_detail = (
+                        err_json.get("error")
+                        or err_json.get("errorMsg")
+                        or err_json.get("message")
+                        or resp_text
+                    )
+            except Exception:
+                pass
+            if http_status == 0:
+                raise RuntimeError(res.get("transport_error") or "rust_clob transport error")
+            raise RuntimeError(f"OrderPlacementError: Order placement failed: HTTP {http_status} - {err_detail}")
+        data = json.loads(resp_text) if resp_text else {}
+        if isinstance(data, dict):
+            data["rust_sign_us"] = res.get("sign_time_us")
+            data["rust_total_us"] = res.get("total_time_us")
+        return data
+
     def place_limit_buy(self, token_id: str, size: float, price: float, expiration: Optional[int] = None) -> Dict[str, Any]:
         """Place a Good 'Til Date (GTD) limit BUY order for `size` shares at `price`.
         Sweeps asks up to `price` and rests any remaining unfilled size on the book
@@ -370,23 +544,23 @@ class ClobTrader:
             except Exception:
                 pass
         try:
-            from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
-            args = OrderArgs(
-                token_id=str(token_id),
-                price=order_price,
-                size=order_size,
-                side="BUY",
-                expiration=exp
-            )
             self.warm_token(token_id)
-            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-            resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
-            if resp is None:
-                return {"ok": False, "error": "no_response_from_clob"}
-            data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
+            )
+            data = self._post_order_fast(
+                token_id=str(token_id),
+                maker_amount=maker_amt,
+                taker_amount=taker_amt,
+                side_int=side_int,
+                order_type_str="GTD",
+                expiration_str=str(exp),
+                neg_risk=False,
+            )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
@@ -413,23 +587,23 @@ class ClobTrader:
             except Exception:
                 pass
         try:
-            from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
-            args = OrderArgs(
-                token_id=str(token_id),
-                price=order_price,
-                size=order_size,
-                side="SELL",
-                expiration=exp
-            )
             self.warm_token(token_id)
-            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-            resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
-            if resp is None:
-                return {"ok": False, "error": "no_response_from_clob"}
-            data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
+            )
+            data = self._post_order_fast(
+                token_id=str(token_id),
+                maker_amount=maker_amt,
+                taker_amount=taker_amt,
+                side_int=side_int,
+                order_type_str="GTD",
+                expiration_str=str(exp),
+                neg_risk=False,
+            )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
@@ -654,7 +828,7 @@ class ClobTrader:
         return self.get_funder()
 
     def withdraw_pusd(self, recipient: str, amount: float) -> Dict[str, Any]:
-        """Transfer pUSD from the funded deposit wallet to `recipient` via gasless relayer."""
+        """Transfer pUSD or USDC.e from the funded wallet to `recipient` via gasless relayer."""
         if not recipient:
             return {"ok": False, "error": "missing_recipient_address"}
         try:
@@ -667,13 +841,75 @@ class ClobTrader:
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
         try:
-            if hasattr(self.gasless, "withdraw_pusd"):
-                tx = self.gasless.withdraw_pusd(recipient, amount)
-            elif hasattr(self.gasless, "transfer_pusd"):
-                tx = self.gasless.transfer_pusd(recipient, amount)
-            else:
-                return {"ok": False, "error": "withdraw_unsupported_by_client"}
-            return {"ok": True, "tx": str(tx)}
+            from web3 import Web3
+            amount_int = int(round(float(amount) * 1e6))
+            target_gasless = self.gasless
+            target_funder = self.funder or self.gasless.address
+            pusd_bal, usdc_e_bal = self._get_onchain_balances(target_gasless, target_funder)
+
+            # If active funder appears below amount on-chain, scan all candidate wallets (Deposit, Proxy, Safe)
+            if pusd_bal < amount and usdc_e_bal < amount:
+                for cand_st, cand_addr in self._candidate_wallets(self.gasless):
+                    c_pusd, c_usdce = self._get_onchain_balances(self.gasless, cand_addr)
+                    if c_pusd >= amount or c_usdce >= amount:
+                        target_funder = cand_addr
+                        pusd_bal, usdc_e_bal = c_pusd, c_usdce
+                        target_gasless = self._new_gasless(cand_st, funder=cand_addr)
+                        break
+
+            # 1. If wallet holds pUSD >= amount, transfer pUSD
+            if pusd_bal >= amount:
+                data = target_gasless._encode_transfer_pusd(recipient, amount_int)
+                tx = target_gasless._execute(
+                    target_gasless.pusd_address,
+                    data,
+                    "pUSD Transfer",
+                    metadata="pusd_transfer",
+                )
+                return {"ok": True, "tx": str(tx), "token": "pUSD", "from": target_funder}
+
+            # 2. If wallet holds bridged USDC.e >= amount, transfer USDC.e
+            if usdc_e_bal >= amount:
+                data = target_gasless._encode_transfer_pusd(recipient, amount_int)
+                tx = target_gasless._execute(
+                    target_gasless.usdc_e_address,
+                    data,
+                    "pUSD Transfer",
+                    metadata="pusd_transfer",
+                )
+                return {"ok": True, "tx": str(tx), "token": "USDC.e", "from": target_funder}
+
+            # 3. Fallback if RPC balance read returned 0.0 but CLOB API reports sufficient collateral
+            clob_bal = 0.0
+            try:
+                if self.clob is not None:
+                    clob_bal = float(self.clob.get_pusd_balance())
+            except Exception:
+                clob_bal = 0.0
+
+            if clob_bal >= amount:
+                data = target_gasless._encode_transfer_pusd(recipient, amount_int)
+                try:
+                    tx = target_gasless._execute(
+                        target_gasless.pusd_address,
+                        data,
+                        "pUSD Transfer",
+                        metadata="pusd_transfer",
+                    )
+                    return {"ok": True, "tx": str(tx), "token": "pUSD", "from": target_funder}
+                except Exception:
+                    tx = target_gasless._execute(
+                        target_gasless.usdc_e_address,
+                        data,
+                        "pUSD Transfer",
+                        metadata="pusd_transfer",
+                    )
+                    return {"ok": True, "tx": str(tx), "token": "USDC.e", "from": target_funder}
+
+            return {
+                "ok": False,
+                "error": f"Insufficient on-chain balance in {target_funder}: pUSD={pusd_bal:.2f}, USDC.e={usdc_e_bal:.2f} (need {amount:.2f})"
+            }
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -721,7 +957,8 @@ class ClobTrader:
             wallets = []
             for st, addr in self._candidate_wallets(probe):
                 try:
-                    bal = float(probe.get_pusd_balance(address=addr))
+                    p_bal, u_bal = self._get_onchain_balances(probe, addr)
+                    bal = max(p_bal, u_bal)
                 except Exception:
                     bal = None
                 wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
@@ -772,13 +1009,15 @@ class ClobTrader:
         except Exception:
             pass
 
-        # Fallback to gasless / on-chain query
+        # Fallback to gasless / on-chain query (checks both pUSD and USDC.e)
         try:
             if self.ready and self.gasless is not None and self.funder:
-                return float(self.gasless.get_pusd_balance(address=self.funder))
+                p_bal, u_bal = self._get_onchain_balances(self.gasless, self.funder)
+                return max(p_bal, u_bal)
             probe = self._new_gasless(3)
             _, funder = self._pick_funded_wallet(probe)
-            return float(probe.get_pusd_balance(address=funder))
+            p_bal, u_bal = self._get_onchain_balances(probe, funder)
+            return max(p_bal, u_bal)
         except Exception:
             return None
 

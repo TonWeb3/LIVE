@@ -1,5 +1,14 @@
 {
   "private_key": "",
+  "copy_trader": {
+    "retry_interval_ms": 300,
+    "max_retries": 5
+  },
+  "live": {
+    "max_slippage": 0.05,
+    "exit_max_retries": 5,
+    "allow_partial_fill": true
+  },
   "relayer": {
     "api_key": ""
   },

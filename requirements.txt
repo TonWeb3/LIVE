@@ -28,3 +28,5 @@ polymarket-apis==2.3.0
 eth-account==0.13.7
 orjson>=3.10.0
 coincurve>=20.0.0
+maturin>=1.7.0
+./rust_clob
