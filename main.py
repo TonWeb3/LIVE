@@ -1125,20 +1125,17 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    if win["chainlink"] is None and current_price and price_is_fresh:
-        if 0 <= since_start < MARK_CAPTURE_WINDOW_MS:
-            win["chainlink"] = current_price
-            win["binance"] = spot_price
-            win["genuine"] = True
-            log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
-                        f"({price_source}) / Binance {spot_price if spot_price else '-'}")
-        elif since_start >= MARK_CAPTURE_WINDOW_MS and since_start < window_ms:
-            win["chainlink"] = current_price
-            win["binance"] = spot_price
-            win["genuine"] = False
-            win["backfilled"] = True
-            log_message(f"Window open backfilled mid-window: Chainlink {current_price:.2f} "
-                        f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+    if (win["chainlink"] is None and current_price and price_is_fresh
+            and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
+        win["chainlink"] = current_price
+        win["binance"] = spot_price
+        win["genuine"] = True
+        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
+                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+    elif win["chainlink"] is None and since_start >= MARK_CAPTURE_WINDOW_MS:
+        if not win.get("skip_logged"):
+            win["skip_logged"] = True
+            log_message(f"Window open not captured (started late mid-window): No strike @ eventStartTime — skipping trading this window")
     state["last_window_start"] = start_ms
     return win
 
@@ -1318,13 +1315,11 @@ async def update_trades(current_prices: Dict[str, Any]):
                 continue
 
             if strike and settlement_price:
-                twap_settle = current_prices.get("chainlink_twap")
-                effective_settle = twap_settle or settlement_price
-                trade["settlement_price_at_expiry"] = effective_settle
-                winning_index = up_index if effective_settle > strike else down_index
-                resolution = "close_vs_open_twap" if twap_settle else "close_vs_open"
+                trade["settlement_price_at_expiry"] = settlement_price
+                winning_index = up_index if settlement_price > strike else down_index
+                resolution = "close_vs_open"
                 trade["settle_wait_s"] = round(waited, 1)
-                log_message(f"SETTLEMENT FALLBACK for {trade['market_slug']}: Polymarket resolution unavailable after {waited:.0f}s — resolved locally via {resolution} ({effective_settle:.2f} vs strike {strike:.2f})")
+                log_message(f"SETTLEMENT FALLBACK for {trade['market_slug']}: Polymarket resolution unavailable after {waited:.0f}s — resolved locally via {resolution} ({settlement_price:.2f} vs strike {strike:.2f})")
 
         if winning_index == -1:
             first_seen = trade.get("unresolved_since")
@@ -2049,11 +2044,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 @app.get("/settings", response_class=HTMLResponse)
 async def get_settings_page(request: Request):
-    return templates.TemplateResponse("settings.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="settings.html")
 
 @app.get("/api/latest")
 async def get_latest():

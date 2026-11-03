@@ -4,7 +4,6 @@ from typing import Optional, Callable, Dict, List
 import aiohttp
 from .config import settings
 from .net_utils import get_proxy_url_for
-from .indicators import ChainlinkTwapTracker
 
 # ── Low-Level Performance: Fast JSON Acceleration (orjson / std json fallback) ──
 try:
@@ -247,7 +246,6 @@ class PolymarketChainlinkStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
-        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
 
     async def start(self):
@@ -321,7 +319,6 @@ class PolymarketChainlinkStream:
                                             updated_at = float(ts_val)
                                             if updated_at < 10000000000: updated_at *= 1000
                                             self.last_updated_at = updated_at
-                                            self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                             if self.on_update:
                                                 res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"})
@@ -337,11 +334,8 @@ class PolymarketChainlinkStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
-    def get_twap(self) -> Optional[float]:
-        return self.twap_tracker.get_twap()
-
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "polymarket_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "polymarket_ws"}
 
     def close(self):
         self.closed = True
@@ -609,7 +603,6 @@ class ChainlinkPriceStream:
         self.on_update = on_update
         self.last_price = None
         self.last_updated_at = None
-        self.twap_tracker = ChainlinkTwapTracker(60.0)
         self.closed = False
         self.wss_urls = settings.POLYGON_WSS_URLS + ([settings.POLYGON_WSS_URL] if settings.POLYGON_WSS_URL else [])
 
@@ -658,7 +651,6 @@ class ChainlinkPriceStream:
                                             self.last_updated_at = int(data_hex[2:66], 16) * 1000
                                         else:
                                             self.last_updated_at = int(time.time() * 1000)
-                                        self.twap_tracker.add_tick(self.last_price, self.last_updated_at)
 
                                         if self.on_update:
                                             res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
@@ -671,11 +663,8 @@ class ChainlinkPriceStream:
                 if not self.closed:
                     await asyncio.sleep(2)
 
-    def get_twap(self) -> Optional[float]:
-        return self.twap_tracker.get_twap()
-
     def get_last(self):
-        return {"price": self.last_price, "updatedAt": self.last_updated_at, "twap": self.twap_tracker.get_twap(), "source": "chainlink_ws"}
+        return {"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"}
 
     def close(self):
         self.closed = True
