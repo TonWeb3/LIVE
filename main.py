@@ -49,7 +49,6 @@ _market_event = asyncio.Event()
 _entry_lock = asyncio.Lock()
 _trade_lock = asyncio.Lock()
 _in_flight_markets = set()
-_executed_windows = set()  # Strict Lockout: never re-enter executed windows
 _last_eval_ts = 0.0
 
 def _sync_active_trades_to_latest_data():
@@ -153,14 +152,6 @@ def load_state():
                 state["last_trade_side"] = loaded.get("last_trade_side")
                 state["last_withdrawal"] = loaded.get("last_withdrawal")
                 log_message(f"State loaded from {STATE_PATH}")
-                for t in state.get("trade_history", []):
-                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
-                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
-                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
-                for t in state.get("active_trades", []):
-                    if t.get("market_id"): _executed_windows.add(str(t["market_id"]))
-                    if t.get("market_slug"): _executed_windows.add(str(t["market_slug"]))
-                    if t.get("window_start_ms"): _executed_windows.add(str(t["window_start_ms"]))
     except Exception as e:
         print(f"Error loading state: {e}")
 
@@ -896,17 +887,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
                 return "slot_busy"
 
-        # STRICT LOCKOUT: Never re-enter THIS window if it was already executed
-        if cur_mkt_id in _executed_windows or cur_slug in _executed_windows or (window_start_ms and str(window_start_ms) in _executed_windows):
-            return "slot_already_executed"
 
-        for t in state.get("trade_history", []):
-            if cur_slug and t.get("market_slug") == cur_slug:
-                return "slot_already_executed"
-            if cur_mkt_id and str(t.get("market_id")) == cur_mkt_id:
-                return "slot_already_executed"
-            if window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms):
-                return "slot_already_executed"
 
         if state["withdraw_state"] == "in_progress":
             return "withdraw_in_progress"
@@ -1012,9 +993,6 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         try:
             state["paper_balance"] -= paper_amount
             state["active_trades"].append(trade)
-            if cur_mkt_id: _executed_windows.add(cur_mkt_id)
-            if cur_slug: _executed_windows.add(cur_slug)
-            if window_start_ms: _executed_windows.add(str(window_start_ms))
             state["last_trade_side"] = side
             _sync_active_trades_to_latest_data()
 
@@ -1147,13 +1125,20 @@ def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[floa
 
     win = opens[start_ms]
     since_start = time.time() * 1000 - start_ms
-    if (win["chainlink"] is None and current_price and price_is_fresh
-            and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
-        win["chainlink"] = current_price
-        win["binance"] = spot_price
-        win["genuine"] = True
-        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
-                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+    if win["chainlink"] is None and current_price and price_is_fresh:
+        if 0 <= since_start < MARK_CAPTURE_WINDOW_MS:
+            win["chainlink"] = current_price
+            win["binance"] = spot_price
+            win["genuine"] = True
+            log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
+                        f"({price_source}) / Binance {spot_price if spot_price else '-'}")
+        elif since_start >= MARK_CAPTURE_WINDOW_MS and since_start < window_ms:
+            win["chainlink"] = current_price
+            win["binance"] = spot_price
+            win["genuine"] = False
+            win["backfilled"] = True
+            log_message(f"Window open backfilled mid-window: Chainlink {current_price:.2f} "
+                        f"({price_source}) / Binance {spot_price if spot_price else '-'}")
     state["last_window_start"] = start_ms
     return win
 
@@ -1529,8 +1514,6 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         return "withdraw_in_progress"
     if not ctx:
         return "no_context"
-    if ctx.get("slot_busy"):
-        return "slot_busy"
     _mkt = ctx.get("market") or {}
     _mid = str(_mkt.get("id") or "")
     _mslug = str(_mkt.get("slug") or "")
@@ -1549,16 +1532,6 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
         if _sms is not None and t.get("window_start_ms") == int(_sms):
             return "slot_busy"
 
-    # Strict Lockout: check if THIS specific window was already executed
-    if _mid in _executed_windows or _mslug in _executed_windows or (_sms and str(_sms) in _executed_windows):
-        return "slot_already_executed"
-    for _ht in state.get("trade_history", []):
-        if _mslug and _ht.get("market_slug") == _mslug:
-            return "slot_already_executed"
-        if _mid and str(_ht.get("market_id")) == _mid:
-            return "slot_already_executed"
-        if _sms is not None and _ht.get("window_start_ms") == int(_sms):
-            return "slot_already_executed"
     if not ctx.get("price_is_fresh"):
         return "stale_feed"
     if ctx.get("strike_open") is None:
@@ -1679,9 +1652,11 @@ async def seed_kline_buffers():
             data.fetch_klines(settings.SYMBOL, "1m", 240),
             data.fetch_klines(settings.SYMBOL, "5m", 200)
         )
-        binance_kline_1m.set_candles(k1m)
-        binance_kline_5m.set_candles(k5m)
-        log_message(f"Seeded Binance kline buffers (1m/5m) for {settings.SYMBOL}")
+        if k1m:
+            binance_kline_1m.set_candles(k1m)
+        if k5m:
+            binance_kline_5m.set_candles(k5m)
+        log_message(f"Seeded Binance kline buffers (1m: {len(k1m) if k1m else 0}, 5m: {len(k5m) if k5m else 0}) for {settings.SYMBOL}")
     except Exception as e:
         log_message(f"Failed to seed kline buffers: {e}")
 
@@ -1768,12 +1743,10 @@ async def update_loop():
 
             model_open = None
             for c in reversed(klines_5m):
-                if c["openTime"] == start_ms:
+                if c["openTime"] == start_ms or (c["openTime"] <= start_ms < c["openTime"] + 300_000):
                     model_open = c["open"]
                     break
-                if c["openTime"] < start_ms:
-                    break
-            model_open = model_open or win.get("binance")
+            model_open = model_open or win.get("binance") or spot_price
             target_open = model_open if strike_open is not None else None
 
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
@@ -1879,7 +1852,7 @@ async def update_loop():
                     "market": poly_snapshot["market"],
                     "market_ok": True,
                     "price_is_fresh": price_is_fresh,
-                    "slot_busy": bool(state["active_trades"]),
+                    "slot_busy": any(str(t.get("market_id")) == str(poly_snapshot["market"].get("id")) for t in state["active_trades"]) if (poly_snapshot.get("ok") and poly_snapshot.get("market")) else False,
                 }
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
@@ -2024,11 +1997,6 @@ async def lifespan(app: FastAPI):
     # Raise gen 0 threshold to 50,000 to prevent GC pauses during sub-millisecond tick bursts.
     import gc
     gc.collect()
-    try:
-        gc.freeze()
-    except Exception:
-        pass
-    gc.set_threshold(50_000, 10, 10)
 
     tasks = [
         asyncio.create_task(binance_stream.start()),

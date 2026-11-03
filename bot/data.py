@@ -3,6 +3,14 @@ from .config import settings
 from typing import List, Dict, Optional
 from .net_utils import get_proxy_url_for
 
+BINANCE_REST_HOSTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com"
+]
+
 def to_number(x) -> Optional[float]:
     try:
         if x is None:
@@ -13,17 +21,26 @@ def to_number(x) -> Optional[float]:
         return None
 
 async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
-    """Fetch historical klines with automatic retry and validation to guarantee full
-    dataset for indicator computation (HA & RSI)."""
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/klines"
+    """Fetch historical klines with automatic multi-endpoint fallback and validation
+    to guarantee full dataset for indicator computation (HA and RSI)."""
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    proxy = get_proxy_url_for(url)
     last_err = None
-    for attempt in range(3):
+
+    seen_hosts = set()
+    hosts = []
+    for h in [settings.BINANCE_BASE_URL] + BINANCE_REST_HOSTS:
+        if h and h not in seen_hosts:
+            seen_hosts.add(h)
+            hosts.append(h)
+
+    for host in hosts:
+        url = f"{host}/api/v3/klines"
+        proxy = get_proxy_url_for(url)
         try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
                 res = await client.get(url, params=params)
-                res.raise_for_status()
+                if res.status_code != 200:
+                    continue
                 data = res.json()
                 if not isinstance(data, list) or len(data) == 0:
                     continue
@@ -40,19 +57,35 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
                     return klines
         except Exception as e:
             last_err = e
+            continue
+
     if last_err:
-        print(f"Warning: fetch_klines failed after retries: {last_err}")
+        print(f"Warning: fetch_klines failed after trying all endpoints: {last_err}")
     return []
 
 async def fetch_last_price(symbol: str) -> Optional[float]:
-    url = f"{settings.BINANCE_BASE_URL}/api/v3/ticker/price"
     params = {"symbol": symbol}
-    proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
-        res = await client.get(url, params=params)
-        res.raise_for_status()
-        data = res.json()
-        return to_number(data.get("price"))
+    seen_hosts = set()
+    hosts = []
+    for h in [settings.BINANCE_BASE_URL] + BINANCE_REST_HOSTS:
+        if h and h not in seen_hosts:
+            seen_hosts.add(h)
+            hosts.append(h)
+
+    for host in hosts:
+        url = f"{host}/api/v3/ticker/price"
+        proxy = get_proxy_url_for(url)
+        try:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=3.0) as client:
+                res = await client.get(url, params=params)
+                if res.status_code == 200:
+                    data = res.json()
+                    p = to_number(data.get("price"))
+                    if p and p > 0:
+                        return p
+        except Exception:
+            continue
+    return None
 
 async def fetch_market_by_slug(slug: str) -> Optional[Dict]:
     url = f"{settings.GAMMA_BASE_URL}/markets"
@@ -63,16 +96,11 @@ async def fetch_market_by_slug(slug: str) -> Optional[Dict]:
         res.raise_for_status()
         data = res.json()
     market = data[0] if isinstance(data, list) and data else data
-    return market if market else None
+    return market if isinstance(market, dict) and market.get("id") else None
 
-async def fetch_live_events_by_series_id(series_id: str, limit: int = 20) -> List[Dict]:
+async def fetch_live_events_by_series_id(series_id: str) -> List[Dict]:
     url = f"{settings.GAMMA_BASE_URL}/events"
-    params = {
-        "series_id": series_id,
-        "active": "true",
-        "closed": "false",
-        "limit": limit
-    }
+    params = {"series_id": series_id, "closed": "false", "limit": 20}
     proxy = get_proxy_url_for(url)
     async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
         res = await client.get(url, params=params)
@@ -80,57 +108,15 @@ async def fetch_live_events_by_series_id(series_id: str, limit: int = 20) -> Lis
         data = res.json()
     return data if isinstance(data, list) else []
 
-async def fetch_available_15m_series() -> List[Dict]:
-    url = f"{settings.GAMMA_BASE_URL}/events"
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 100,
-        "tag_id": "102467" # 15M tag
-    }
-    proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
-        try:
-            res = await client.get(url, params=params)
-            res.raise_for_status()
-            events = res.json()
-        except:
-            events = []
-
-    series_map = {}
-    defaults = {
-        "10192": "Bitcoin Up or Down 15m",
-        "10212": "Ethereum Up or Down 15m"
-    }
-    for sid, name in defaults.items():
-        series_map[sid] = {"series_id": sid, "title": name}
-
-    for e in events:
-        series_slug = e.get("seriesSlug", "")
-        if "up-or-down-15m" in series_slug:
-            sid = e.get("series_id")
-            if not sid and e.get("series") and isinstance(e["series"], list) and len(e["series"]) > 0:
-                sid = e["series"][0].get("id")
-
-            if sid:
-                asset = series_slug.split("-")[0].upper()
-                series_map[str(sid)] = {
-                    "series_id": str(sid),
-                    "title": f"{asset} Up or Down 15m",
-                    "slug": series_slug
-                }
-
-    return sorted(list(series_map.values()), key=lambda x: x["title"])
-
 def flatten_event_markets(events: List[Dict]) -> List[Dict]:
-    out = []
-    for e in events:
-        markets = e.get("markets", [])
-        if isinstance(markets, list):
-            out.extend(markets)
-    return out
+    markets = []
+    for event in events:
+        for m in event.get("markets", []):
+            if isinstance(m, dict):
+                markets.append(m)
+    return markets
 
-async def fetch_clob_price(token_id: str, side: str) -> Optional[float]:
+async def fetch_clob_price(token_id: str, side: str = "buy") -> Optional[float]:
     url = f"{settings.CLOB_BASE_URL}/price"
     params = {"token_id": token_id, "side": side}
     proxy = get_proxy_url_for(url)
@@ -138,7 +124,7 @@ async def fetch_clob_price(token_id: str, side: str) -> Optional[float]:
         res = await client.get(url, params=params)
         res.raise_for_status()
         data = res.json()
-    return to_number(data.get("price"))
+        return to_number(data.get("price"))
 
 async def fetch_order_book(token_id: str) -> Dict:
     url = f"{settings.CLOB_BASE_URL}/book"
@@ -149,59 +135,43 @@ async def fetch_order_book(token_id: str) -> Dict:
         res.raise_for_status()
         return res.json()
 
-def summarize_order_book(book: Dict, depth_levels: int = 5) -> Dict:
+def summarize_order_book(book: Dict) -> Dict:
     bids = book.get("bids", [])
     asks = book.get("asks", [])
 
-    best_bid = None
-    if bids:
-        for lvl in bids:
-            p = to_number(lvl.get("price"))
-            if p is not None:
-                best_bid = max(best_bid, p) if best_bid is not None else p
+    def parse_entry(entry):
+        if isinstance(entry, dict):
+            return to_number(entry.get("price")), to_number(entry.get("size"))
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            return to_number(entry[0]), to_number(entry[1])
+        return None, None
 
-    best_ask = None
-    if asks:
-        for lvl in asks:
-            p = to_number(lvl.get("price"))
-            if p is not None:
-                best_ask = min(best_ask, p) if best_ask is not None else p
+    valid_bids = []
+    for b in bids:
+        p, s = parse_entry(b)
+        if p is not None and s is not None:
+            valid_bids.append((p, s))
 
-    spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
-    bid_liquidity = sum(to_number(lvl.get("size")) or 0 for lvl in bids[:depth_levels])
-    ask_liquidity = sum(to_number(lvl.get("size")) or 0 for lvl in asks[:depth_levels])
+    valid_asks = []
+    for a in asks:
+        p, s = parse_entry(a)
+        if p is not None and s is not None:
+            valid_asks.append((p, s))
+
+    valid_bids.sort(key=lambda x: x[0], reverse=True)
+    valid_asks.sort(key=lambda x: x[0])
+
+    best_bid = valid_bids[0][0] if valid_bids else None
+    best_ask = valid_asks[0][0] if valid_asks else None
+    spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+
+    bid_liq = sum(s for _, s in valid_bids[:5]) if valid_bids else 0.0
+    ask_liq = sum(s for _, s in valid_asks[:5]) if valid_asks else 0.0
 
     return {
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spread": spread,
-        "bidLiquidity": bid_liquidity,
-        "askLiquidity": ask_liquidity
+        "bidLiquidity": bid_liq,
+        "askLiquidity": ask_liq
     }
-
-def sweep_sell(bids: List[Dict], size: float) -> Optional[float]:
-    """Calculate the effective VWAP sell price for `size` shares against order book bids.
-    Returns None if book has 0 liquidity."""
-    if not bids or size <= 0:
-        return None
-    sorted_bids = []
-    for b in bids:
-        p = to_number(b.get("price"))
-        s = to_number(b.get("size"))
-        if p is not None and s is not None and s > 0:
-            sorted_bids.append((p, s))
-    sorted_bids.sort(key=lambda x: x[0], reverse=True)
-
-    rem = size
-    total_val = 0.0
-    total_size = 0.0
-    for p, s in sorted_bids:
-        take = min(rem, s)
-        total_val += take * p
-        total_size += take
-        rem -= take
-        if rem <= 0:
-            break
-    if total_size <= 0:
-        return None
-    return total_val / total_size

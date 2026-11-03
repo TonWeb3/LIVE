@@ -49,7 +49,7 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot Book WS ({url}): {self.symbol}@bookTicker")
                         while not self.closed:
                             msg = await ws.receive()
@@ -84,7 +84,7 @@ class BinanceTradeStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
@@ -132,12 +132,17 @@ class BinanceTradeStream:
 
 
 class BinanceKlineStream:
+    """Binance Kline stream for 1m and 5m candles with sliding window buffer.
+    Guarantees strict chronological ordering, gap detection and auto-backfill,
+    and automatic reconnection with heartbeat to avoid hanging dead sockets."""
     def __init__(self, symbol: str, interval: str, limit: int = 240):
         self.symbol = symbol.lower()
         self.interval = interval
         self.limit = limit
         self.candles = []
         self.closed = False
+        self._lock = asyncio.Lock()
+        self._step_ms = 60_000 if interval == "1m" else 300_000
 
     async def start(self):
         endpoints = [
@@ -151,8 +156,9 @@ class BinanceKlineStream:
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=30.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Kline WS ({url}): {self.symbol} {self.interval}")
                         while not self.closed:
                             msg = await ws.receive()
@@ -168,32 +174,67 @@ class BinanceKlineStream:
                                         "close": float(k.get("c")),
                                         "volume": float(k.get("v")),
                                         "closeTime": int(k.get("T")),
-                                        "isClosed": k.get("x")
+                                        "isClosed": bool(k.get("x"))
                                     }
-                                    self._update_candle(candle)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    async with self._lock:
+                                        self._update_candle(candle)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 break
             except Exception as e:
-                print(f"Binance Kline WS failed ({url}): {e}")
                 if not self.closed:
-                    await asyncio.sleep(5)
+                    print(f"Binance Kline WS reconnecting ({url}): {e}")
+                    await asyncio.sleep(2)
 
     def _update_candle(self, candle: Dict):
         if not self.candles:
             self.candles.append(candle)
+            return
+
+        last = self.candles[-1]
+        c_open = candle["openTime"]
+        l_open = last["openTime"]
+
+        if c_open == l_open:
+            self.candles[-1] = candle
+        elif c_open > l_open:
+            if (c_open - l_open) > (self._step_ms * 1.5):
+                asyncio.create_task(self._backfill_gap())
+            self.candles.append(candle)
+            if len(self.candles) > self.limit:
+                self.candles.pop(0)
         else:
-            if candle["openTime"] == self.candles[-1]["openTime"]:
-                self.candles[-1] = candle
-            else:
-                self.candles.append(candle)
-        if len(self.candles) > self.limit:
-            self.candles.pop(0)
+            for i, c in enumerate(self.candles):
+                if c["openTime"] == c_open:
+                    self.candles[i] = candle
+                    return
+            self.candles.append(candle)
+            self.candles.sort(key=lambda x: x["openTime"])
+            if len(self.candles) > self.limit:
+                self.candles = self.candles[-self.limit:]
+
+    async def _backfill_gap(self):
+        try:
+            from . import data
+            klines = await data.fetch_klines(self.symbol.upper(), self.interval, self.limit)
+            if klines and len(klines) >= 10:
+                async with self._lock:
+                    self.set_candles(klines)
+        except Exception:
+            pass
 
     def set_candles(self, candles: List[Dict]):
-        self.candles = candles[-self.limit:]
+        if not candles:
+            return
+        seen = set()
+        deduped = []
+        for c in sorted(candles, key=lambda x: x["openTime"]):
+            if c["openTime"] not in seen:
+                seen.add(c["openTime"])
+                deduped.append(c)
+        self.candles = deduped[-self.limit:]
 
-    def get_candles(self):
-        return self.candles
+    def get_candles(self) -> List[Dict]:
+        return list(self.candles)
 
     def close(self):
         self.closed = True
@@ -229,7 +270,7 @@ class PolymarketChainlinkStream:
                 }
                 async with aiohttp.ClientSession(headers=headers) as session:
                     print(f"Connecting to Polymarket WS: {self.ws_url}")
-                    async with session.ws_connect(self.ws_url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Polymarket WS. Subscribing to topics...")
 
                         topics = ["crypto_prices_chainlink", "price_chainlink", "settlement_prices"]
@@ -351,7 +392,7 @@ class PolymarketClobMarketStream:
             try:
                 proxy = get_proxy_url_for(self.ws_url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.ws_url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         self._ws = ws
                         print(f"Connected to Polymarket CLOB Market WS: {self.ws_url}")
                         await self._subscribe(ws)
@@ -583,7 +624,7 @@ class ChainlinkPriceStream:
             try:
                 proxy = get_proxy_url_for(url)
                 async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, compress=0, proxy=proxy if proxy else None) as ws:
+                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Chainlink RPC WS: {url}")
                         sub_msg = {
                             "jsonrpc": "2.0",
