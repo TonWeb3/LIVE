@@ -483,7 +483,10 @@
                         this.lastLogSeq = seq;
                         if (this.tab === 'logs') this.refreshLogs();
                     }
-                    if (this.tab === 'history' && (!this.tradeHistory || !this.tradeHistory.length || seq !== this.lastLogSeq)) this.loadHistory();
+                    if (this.tab === 'history' && (!this._lastHistorySeq || this._lastHistorySeq !== seq)) {
+                    this._lastHistorySeq = seq;
+                    this.loadHistory();
+                }
                 },
                 async loadHistory() {
                     try { this.tradeHistory = (await (await fetch('/history')).json()).reverse(); }

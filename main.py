@@ -1206,12 +1206,32 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
         trade["live_profit_loss"] = (sell_shares * live_fill_px) - float(trade.get("live_amount") or 0.0)
         log_message(f"FLIP: Live {trade['side']} sold @ {live_fill_px:.4f} (Live P/L ${trade['live_profit_loss']:.2f})")
     elif trade.get("live_status") in ("FILLING", "GTD_OPEN"):
-        if trade.get("live_status") == "GTD_OPEN" and trade.get("live_order_id"):
-            log_message(f"FLIP: Cancelling resting GTD order {trade['live_order_id']}")
-            await asyncio.to_thread(clob_trader.cancel_order, trade["live_order_id"])
-        trade["live_status"] = "CANCELLED_BY_FLIP"
-        trade["live_closed_time"] = now_iso
-        trade["live_profit_loss"] = 0.0
+        order_id = trade.get("live_order_id")
+        token_id = token_ids.get(held_key)
+        if order_id:
+            log_message(f"FLIP: Cancelling resting GTD order {order_id}")
+            await asyncio.to_thread(clob_trader.cancel_order, order_id)
+            fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id) if token_id else []
+            if fills:
+                filled_shares = sum(float(f["size"]) for f in fills)
+                if filled_shares > 0:
+                    log_message(f"FLIP: Resting GTD had {filled_shares:.2f} filled shares — selling before flip")
+                    sell_res = await asyncio.to_thread(clob_trader.place_limit_sell, token_id, filled_shares, exit_price)
+                    if not sell_res.get("ok"):
+                        log_message(f"FLIP ABORTED: Live sell of partial fills failed ({sell_res.get('error')}) — holding to prevent self-hedging")
+                        return None
+                    live_fill_px = float(sell_res.get("fill_price") or exit_price)
+                    trade["live_shares"] = filled_shares
+                    trade["live_close_price"] = live_fill_px
+                    trade["live_closed_time"] = now_iso
+                    trade["live_exit_order_id"] = sell_res.get("order_id")
+                    trade["live_status"] = "FILLED"
+                    trade["live_profit_loss"] = (filled_shares * live_fill_px) - float(trade.get("live_amount") or 0.0)
+                    log_message(f"FLIP: Sold partial fills @ {live_fill_px:.4f} (Live P/L ${trade['live_profit_loss']:.2f})")
+        if trade.get("live_status") != "FILLED":
+            trade["live_status"] = "CANCELLED_BY_FLIP"
+            trade["live_closed_time"] = now_iso
+            trade["live_profit_loss"] = 0.0
 
     # 2. Close paper trade only after live position exit is confirmed
     state["paper_balance"] += trade["paper_shares"] * exit_price
@@ -1277,6 +1297,12 @@ async def _redeem_win(trade: Dict[str, Any], market: Optional[Dict[str, Any]],
     if not condition_id:
         trade["redeem"] = {"ok": False, "error": "missing_condition_id"}
         log_message(f"REDEEM skipped for {trade['market_slug']}: no conditionId on the market")
+        return
+
+    # Defer on-chain redemption if market was settled via local strike fallback and on-chain outcome is still pending
+    if trade.get("resolution") == "close_vs_open":
+        trade["redeem_status"] = "PENDING_ONCHAIN_RESOLUTION"
+        log_message(f"REDEEM deferred for {trade['market_slug']}: Position won via local fallback; waiting for on-chain Polymarket resolution before redeeming.")
         return
 
     amounts = [0.0, 0.0]
@@ -1442,7 +1468,7 @@ async def update_trades(current_prices: Dict[str, Any]):
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
 
-            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S and not market_closed:
+            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S:
                 remaining_active.append(trade)
                 continue
 
@@ -2525,6 +2551,7 @@ async def get_settings():
         "live": {
             "relayer_api_key": mask(settings.RELAYER_API_KEY),
             "alchemy_api_key": mask(settings.ALCHEMY_API_KEY),
+            "funder_address": settings.FUNDER_ADDRESS,
             "max_slippage": settings.CLOB_MAX_SLIPPAGE,
             "exit_max_retries": settings.EXIT_MAX_RETRIES,
             "allow_partial_fill": settings.CLOB_ALLOW_PARTIAL_FILL
@@ -2603,7 +2630,40 @@ async def post_settings(new_settings: Dict[str, Any]):
                 base[k] = v
         return base
 
+    # Pre-sync live relayer & alchemy keys into config dictionaries before dumping to disk
+    if "live" in new_settings:
+        lv = new_settings["live"]
+        rk = lv.get("relayer_api_key")
+        if rk and "..." not in rk:
+            settings.RELAYER_API_KEY = rk
+            new_settings.setdefault("relayer", {})["api_key"] = rk
+            existing_cfg.setdefault("relayer", {})["api_key"] = rk
+        elif rk:
+            lv["relayer_api_key"] = settings.RELAYER_API_KEY
+        fa = lv.get("funder_address") if "funder_address" in lv else new_settings.get("funder_address")
+        if fa is not None:
+            from bot.config import normalize_funder_address
+            settings.FUNDER_ADDRESS = normalize_funder_address(fa)
+            lv["funder_address"] = settings.FUNDER_ADDRESS
+            existing_cfg.setdefault("live", {})["funder_address"] = settings.FUNDER_ADDRESS
+            existing_cfg["funder_address"] = settings.FUNDER_ADDRESS
+        ak = lv.get("alchemy_api_key")
+        if ak and "..." not in ak:
+            settings.ALCHEMY_API_KEY = ak
+            new_settings.setdefault("chainlink", {})["alchemy_api_key"] = ak
+            existing_cfg.setdefault("chainlink", {})["alchemy_api_key"] = ak
+        elif ak:
+            lv["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+
     merged_cfg = deep_merge(existing_cfg, new_settings)
+    if settings.RELAYER_API_KEY:
+        merged_cfg.setdefault("relayer", {})["api_key"] = settings.RELAYER_API_KEY
+    if settings.ALCHEMY_API_KEY:
+        merged_cfg.setdefault("chainlink", {})["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+    if settings.FUNDER_ADDRESS:
+        merged_cfg.setdefault("live", {})["funder_address"] = settings.FUNDER_ADDRESS
+        merged_cfg["funder_address"] = settings.FUNDER_ADDRESS
+
     # Remove obsolete keys if present in file
     merged_cfg.pop("mode", None)
     merged_cfg.pop("paper_balance_usd", None)
@@ -2739,6 +2799,10 @@ async def setup_wallet(body: Optional[Dict[str, Any]] = None):
     ak = body.get("alchemy_api_key")
     if ak and "..." not in ak:
         settings.ALCHEMY_API_KEY = ak
+    fa = body.get("funder_address")
+    if fa is not None and "..." not in str(fa):
+        from bot.config import normalize_funder_address
+        settings.FUNDER_ADDRESS = normalize_funder_address(fa)
     clob_trader.reset()
     try:
         result = await asyncio.to_thread(clob_trader.ensure_setup)
@@ -2780,6 +2844,38 @@ async def test_connection(body: Optional[Dict[str, Any]] = None):
     ak = body.get("alchemy_api_key")
     if ak and "..." not in ak:
         settings.ALCHEMY_API_KEY = ak
+    fa = body.get("funder_address")
+    if fa is not None and "..." not in str(fa):
+        from bot.config import normalize_funder_address
+        settings.FUNDER_ADDRESS = normalize_funder_address(fa)
+
+    # Persist tested credentials to config.json so they survive server restarts
+    cfg_file = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
+    try:
+        cfg = {}
+        if os.path.exists(cfg_file):
+            with open(cfg_file, "r") as f:
+                cfg = json.load(f)
+        changed = False
+        if pk and "..." not in str(pk):
+            cfg["private_key"] = settings.PRIVATE_KEY
+            changed = True
+        if rk and "..." not in str(rk):
+            cfg.setdefault("relayer", {})["api_key"] = settings.RELAYER_API_KEY
+            changed = True
+        if ak and "..." not in str(ak):
+            cfg.setdefault("chainlink", {})["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+            changed = True
+        if fa is not None and "..." not in str(fa):
+            cfg.setdefault("live", {})["funder_address"] = settings.FUNDER_ADDRESS
+            cfg["funder_address"] = settings.FUNDER_ADDRESS
+            changed = True
+        if changed:
+            with open(cfg_file, "w") as f:
+                json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Failed to persist keys in test_connection: {e}")
+
     clob_trader.reset()
     try:
         result = await asyncio.to_thread(clob_trader.test_connection)

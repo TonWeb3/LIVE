@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # safe — whichever actually holds pUSD. Nothing to pick by hand.
     CLOB_MAX_SLIPPAGE: float = 0.05  # marketable-limit buffer above the quote (probability units, 5¢)
     EXIT_MAX_RETRIES: int = 5
+    FUNDER_ADDRESS: str = ""         # optional explicit deposit/funder wallet override (bypasses guessing)
     CLOB_ALLOW_PARTIAL_FILL: bool = True  # Allow partial fill for thin books
     RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
     ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
@@ -111,6 +112,18 @@ class Settings(BaseSettings):
     HTTPS_PROXY: str = os.getenv("HTTPS_PROXY", os.getenv("https_proxy", ""))
     ALL_PROXY: str = os.getenv("ALL_PROXY", os.getenv("all_proxy", ""))
 
+
+def normalize_funder_address(addr: str) -> str:
+    """Validate and checksum user-specified funder/deposit wallet address."""
+    addr = (addr or "").strip()
+    if not addr or not addr.startswith("0x") or len(addr) != 42:
+        return ""
+    try:
+        from eth_utils import to_checksum_address
+        return to_checksum_address(addr)
+    except Exception:
+        return addr
+
 def normalize_private_key(secret: str) -> str:
     """Accept either a raw hex private key or a 12/24-word seed phrase and return a
     hex private key. EOA only — the trading wallet is derived from this secret and
@@ -137,6 +150,10 @@ def load_settings():
 
             if "mode" in config_data: base_settings.MODE = config_data["mode"]
             if "paper_balance_usd" in config_data: base_settings.PAPER_BALANCE_USD = config_data["paper_balance_usd"]
+            if "funder_address" in config_data:
+                base_settings.FUNDER_ADDRESS = normalize_funder_address(config_data["funder_address"])
+            if "live" in config_data and "funder_address" in config_data["live"]:
+                base_settings.FUNDER_ADDRESS = normalize_funder_address(config_data["live"]["funder_address"])
             if "private_key" in config_data:
                 base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 

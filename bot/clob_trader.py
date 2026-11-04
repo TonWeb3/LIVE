@@ -138,50 +138,91 @@ _patch_crypto_signing()
 
 def _ensure_rust_clob():
     """Ensure the native Rust `rust_clob` extension is compiled and imported for the
-    current OS/CPU architecture. If not yet installed in site-packages, automatically
-    bootstraps the Rust toolchain (if needed) and builds `./rust_clob` via pip."""
+    current OS/CPU architecture. If not yet installed or if source files were modified,
+    automatically rebuilds `./rust_clob` via pip."""
+    import os
+    import sys
+    import shutil
+    import subprocess
+    import importlib
+
+    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    crate_dir = os.path.join(proj_root, "rust_clob")
+    src_file = os.path.join(crate_dir, "src", "lib.rs")
+    cargo_file = os.path.join(crate_dir, "Cargo.toml")
+
+    rebuild_needed = False
     try:
         import rust_clob
-        return rust_clob
+        mod_file = getattr(rust_clob, "__file__", None)
+        if mod_file and os.path.exists(mod_file):
+            bin_mtime = os.path.getmtime(mod_file)
+            for src_p in (src_file, cargo_file):
+                if os.path.exists(src_p) and os.path.getmtime(src_p) > bin_mtime:
+                    rebuild_needed = True
+                    break
+        if not rebuild_needed:
+            return rust_clob
     except ImportError:
-        import os
-        import sys
-        import shutil
-        import subprocess
+        rebuild_needed = True
 
-        proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        crate_dir = os.path.join(proj_root, "rust_clob")
-        if not os.path.isdir(crate_dir):
-            raise RuntimeError(f"Missing rust_clob crate directory at {crate_dir}")
+    if not os.path.isdir(crate_dir):
+        raise RuntimeError(f"Missing rust_clob crate directory at {crate_dir}")
 
-        env = os.environ.copy()
-        cargo_bin = os.path.expanduser("~/.cargo/bin")
-        if os.path.isdir(cargo_bin) and cargo_bin not in env.get("PATH", ""):
+    env = os.environ.copy()
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if os.path.isdir(cargo_bin) and cargo_bin not in env.get("PATH", ""):
+        env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    if not shutil.which("cargo", path=env.get("PATH")):
+        if os.name != "nt":
+            print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
+            subprocess.run(
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
+                shell=True,
+                check=True,
+                env=env,
+            )
             env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+        else:
+            raise RuntimeError("Rust toolchain (cargo) not found in PATH.")
 
-        if not shutil.which("cargo", path=env.get("PATH")):
-            if os.name != "nt":
-                print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
-                subprocess.run(
-                    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
-                    shell=True,
-                    check=True,
-                    env=env,
-                )
-                env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
-            else:
-                raise RuntimeError("Rust toolchain (cargo) not found in PATH.")
-
-        print(f"[rust_clob] Compiling native Rust extension from {crate_dir} ...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", crate_dir],
-            check=True,
-            env=env,
-        )
+    print(f"[rust_clob] Compiling/reinstalling native Rust extension from {crate_dir} ...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", crate_dir],
+        check=True,
+        env=env,
+    )
+    if "rust_clob" in sys.modules:
         import rust_clob
-        return rust_clob
+        return importlib.reload(rust_clob)
+    import rust_clob
+    return rust_clob
 
 
+def derive_beacon_deposit_wallet(eoa_address: str) -> str:
+    """Derive deterministic ERC-1967 Beacon Proxy deposit wallet address
+    introduced in Polymarket's June 29, 2026 upgrade.
+    Uses CREATE2 with Solady LibClone initCodeHashERC1967BeaconProxy."""
+    from eth_utils import keccak, to_checksum_address, to_bytes
+    from eth_abi import encode
+
+    owner = to_checksum_address(eoa_address)
+    factory = to_checksum_address("0x00000000000Fb5C9ADea0298D729A0CB3823Cc07")
+    beacon = to_checksum_address("0x7A18EDfe055488A3128f01F563e5B479D92ffc3a")
+
+    owner_b32 = to_bytes(hexstr=owner).rjust(32, b"\x00")
+    args = encode(["address", "bytes32"], [factory, owner_b32])
+    salt = keccak(args)
+
+    prefix = bytes.fromhex("60523d8160223d3973")
+    beacon_b20 = to_bytes(hexstr=beacon)
+    suffix = bytes.fromhex("60195155f3363d3d373d3d363d602036600436635c60da1b60e01b36527fa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50545afa5036515af43d6000803e604d573d6000fd5b3d6000f3")
+    bytecode_hash = keccak(prefix + beacon_b20 + suffix)
+
+    create2_input = b"\xff" + to_bytes(hexstr=factory) + salt + bytecode_hash
+    derived_bytes = keccak(create2_input)[12:]
+    return to_checksum_address(derived_bytes)
 
 
 class ClobTrader:
@@ -222,7 +263,6 @@ class ClobTrader:
             self._cached_balance = None
             self._last_balance_ts = 0.0
             self._balance_fetching = False
-
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
         """CLOB API creds derived from the key (L1 auth). Cached. Doubles as the
@@ -293,62 +333,102 @@ class ClobTrader:
             usdc_e_bal = 0.0
         return pusd_bal, usdc_e_bal
 
-    def _candidate_wallets(self, gasless) -> List[Tuple[int, str]]:
-        """(signature_type, address) candidates derived from the EOA: deposit-wallet
-        (V2, st=3), legacy proxy (st=1), safe (st=2), plus any active maker address."""
-        out: List[Tuple[int, str]] = []
-        # 1. Register standard derived wallets first so their true signature_type (3, 1, 2) is preserved
-        for st, getter in (
-            (3, gasless.get_expected_deposit_wallet),
-            (1, gasless.get_poly_proxy_wallet_address),
-            (2, gasless.get_safe_proxy_wallet_address),
-        ):
+    def _candidate_wallets(self, gasless) -> List[Tuple[int, str, str]]:
+        """(signature_type, address, label) candidates derived from the EOA:
+        1. Explicit user override if configured
+        2. Modern Beacon Deposit Wallet (V2, st=3, post-June 29 standard)
+        3. Legacy UUPS Deposit Wallet (st=3, pre-June 29)
+        4. Legacy Proxy Wallet (st=1)
+        5. Safe Proxy Wallet (st=2)
+        6. Direct EOA Signer (st=0)
+        Never includes unverified counterparty maker addresses from market trades."""
+        out: List[Tuple[int, str, str]] = []
+
+        # Explicit user override
+        explicit_funder = getattr(settings, "FUNDER_ADDRESS", "").strip()
+        if explicit_funder and explicit_funder.startswith("0x") and len(explicit_funder) == 42:
             try:
-                addr = getter()
-                if addr and not any(a.lower() == addr.lower() for _, a in out):
-                    out.append((st, addr))
+                from web3 import Web3
+                chk = Web3.to_checksum_address(explicit_funder)
+                detected_st = None
+                try:
+                    detected_st = gasless.detect_wallet_signature_type(chk)
+                except Exception:
+                    detected_st = None
+                st_to_use = detected_st if detected_st in (0, 1, 2, 3) else 3
+                out.append((st_to_use, chk, "Configured Funder (User Override)"))
+                return out
             except Exception:
                 pass
 
-        # Include direct EOA (st=0) for standard web3 accounts
+        # Derive EOA address
+        eoa_addr = None
         try:
             from eth_account import Account
             eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
-            if eoa_addr and not any(a.lower() == eoa_addr.lower() for _, a in out):
-                out.append((0, eoa_addr))
+        except Exception:
+            eoa_addr = None
+
+        # 1. Modern Beacon Proxy Deposit Wallet (st=3, June 29, 2026+ standard)
+        if eoa_addr:
+            try:
+                beacon_wallet = derive_beacon_deposit_wallet(eoa_addr)
+                if beacon_wallet and not any(a.lower() == beacon_wallet.lower() for _, a, _ in out):
+                    out.append((3, beacon_wallet, "Deposit Wallet (Beacon V2)"))
+            except Exception:
+                pass
+
+        # 2. Legacy UUPS Deposit Wallet (st=3, polymarket-apis 2.3.0 default)
+        try:
+            legacy_dep = gasless.get_expected_deposit_wallet()
+            if legacy_dep and not any(a.lower() == legacy_dep.lower() for _, a, _ in out):
+                out.append((3, legacy_dep, "Legacy Deposit Wallet (UUPS)"))
         except Exception:
             pass
 
-        # 2. Check previous active maker address from CLOB trades if not already in candidates
+        # 3. Polymarket Proxy Wallet (st=1)
         try:
-            from polymarket_apis.clients.clob_client import PolymarketClobClient
-            from eth_account import Account
-            eoa = Account.from_key(settings.PRIVATE_KEY).address
-            c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa, chain_id=137, signature_type=0)
-            c.set_api_creds(self._derive_creds())
-            trades = c.get_trades()
-            if trades:
-                first = trades[0]
-                m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
-                if m_addr and not any(a.lower() == m_addr.lower() for _, a in out):
-                    detected_st = None
-                    try:
-                        detected_st = gasless.detect_wallet_signature_type(m_addr)
-                    except Exception:
-                        detected_st = None
-                    st_to_use = detected_st if detected_st in (1, 2, 3) else 3
-                    out.append((st_to_use, m_addr))
+            poly_proxy = gasless.get_poly_proxy_wallet_address()
+            if poly_proxy and not any(a.lower() == poly_proxy.lower() for _, a, _ in out):
+                out.append((1, poly_proxy, "Polymarket Proxy Wallet"))
         except Exception:
             pass
+
+        # 4. Safe Proxy Wallet (st=2)
+        try:
+            safe_proxy = gasless.get_safe_proxy_wallet_address()
+            if safe_proxy and not any(a.lower() == safe_proxy.lower() for _, a, _ in out):
+                out.append((2, safe_proxy, "Gnosis Safe Proxy"))
+        except Exception:
+            pass
+
+        # 5. Direct EOA (st=0)
+        if eoa_addr and not any(a.lower() == eoa_addr.lower() for _, a, _ in out):
+            out.append((0, eoa_addr, "Personal Signer (EOA)"))
 
         return out
 
     def _pick_funded_wallet(self, gasless) -> Tuple[int, str]:
         """Trade from where the money actually is: pick the candidate holding pUSD or USDC.e.
-        Falls back to CLOB API balance check and then the deposit wallet when balances read 0."""
+        Falls back to CLOB API balance check and then the Beacon deposit wallet when balances read 0."""
+        explicit_funder = getattr(settings, "FUNDER_ADDRESS", "").strip()
+        if explicit_funder and explicit_funder.startswith("0x") and len(explicit_funder) == 42:
+            try:
+                from web3 import Web3
+                chk = Web3.to_checksum_address(explicit_funder)
+                detected_st = None
+                try:
+                    detected_st = gasless.detect_wallet_signature_type(chk)
+                except Exception:
+                    detected_st = None
+                return (detected_st if detected_st in (0, 1, 2, 3) else 3), chk
+            except Exception:
+                pass
+
         candidates = self._candidate_wallets(gasless)
         best = None  # (sig_type, addr, total_onchain_balance)
-        for st, addr in candidates:
+        for item in candidates:
+            st, addr = item[0], item[1]
             pusd_bal, usdc_e_bal = self._get_onchain_balances(gasless, addr)
             total_bal = max(pusd_bal, usdc_e_bal)
             if best is None or total_bal > best[2]:
@@ -357,36 +437,34 @@ class ClobTrader:
         if best and best[2] > 0:
             return best[0], best[1]
 
-        # Fallback: check CLOB API collateral balance across candidate signature types & maker address
+        # Fallback: check CLOB API collateral balance across user's genuine candidate wallets
         try:
             from polymarket_apis.clients.clob_client import PolymarketClobClient
-            from eth_account import Account
-            eoa = Account.from_key(settings.PRIVATE_KEY).address
             creds = self._derive_creds()
-            for st, addr in candidates:
+            for item in candidates:
+                st, addr = item[0], item[1]
                 try:
                     c = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=addr, chain_id=137, signature_type=st)
                     c.set_api_creds(creds)
                     clob_bal = float(c.get_pusd_balance())
                     if clob_bal > 0:
-                        trades = c.get_trades()
-                        if trades:
-                            first = trades[0]
-                            m_addr = getattr(first, "maker_address", None) or (first.get("maker_address") if isinstance(first, dict) else None)
-                            if m_addr:
-                                for cand_st, cand_addr in candidates:
-                                    if cand_addr.lower() == m_addr.lower():
-                                        return cand_st, cand_addr
-                                return st, m_addr
                         return st, addr
                 except Exception:
                     continue
         except Exception:
             pass
 
-        if best:
-            return best[0], best[1]
-        return 3, gasless.get_expected_deposit_wallet()
+        if candidates:
+            # First candidate is the modern Beacon deposit wallet
+            return candidates[0][0], candidates[0][1]
+
+        # Ultimate fallback
+        try:
+            from eth_account import Account
+            eoa = Account.from_key(settings.PRIVATE_KEY).address
+            return 3, derive_beacon_deposit_wallet(eoa)
+        except Exception:
+            return 3, gasless.get_expected_deposit_wallet()
 
     def _init_clients(self):
         from polymarket_apis.clients.clob_client import PolymarketClobClient
@@ -970,13 +1048,16 @@ class ClobTrader:
         try:
             probe = self._new_gasless(3)
             wallets = []
-            for st, addr in self._candidate_wallets(probe):
+            candidates = self._candidate_wallets(probe)
+            for item in candidates:
+                st, addr = item[0], item[1]
+                lbl = item[2] if len(item) > 2 else "Wallet"
                 try:
                     p_bal, u_bal = self._get_onchain_balances(probe, addr)
                     bal = max(p_bal, u_bal)
                 except Exception:
                     bal = None
-                wallets.append({"signature_type": st, "address": addr, "pusd_balance": bal})
+                wallets.append({"signature_type": st, "address": addr, "label": lbl, "pusd_balance": bal})
             sig_type, funder = self._pick_funded_wallet(probe)
 
             # Query CLOB API directly for true tradeable balance
@@ -994,9 +1075,9 @@ class ClobTrader:
             except Exception:
                 pass
 
-            if clob_bal is not None and clob_bal > 0:
+            if clob_bal is not None and clob_bal >= 0:
                 for w in wallets:
-                    if w["signature_type"] == sig_type:
+                    if w["address"].lower() == funder.lower():
                         w["pusd_balance"] = clob_bal
 
             return {

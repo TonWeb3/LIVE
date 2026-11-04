@@ -302,6 +302,23 @@
                             <p class="text-[10px] text-gray-500 mt-2 italic">A private RPC for chain reads. Blank uses the public default.</p>
                         </div>
                     </div>
+                    <div>
+                        <div class="flex items-center justify-between mb-2">
+                            <label class="block text-gray-400 text-xs sm:text-sm uppercase font-bold tracking-wider">Polymarket Funder / Deposit Wallet Address <span class="text-gray-500 font-normal">(Optional Override)</span></label>
+                            <button type="button" x-show="form.live.funder_address"
+                                    @click="form.live.funder_address = ''"
+                                    class="text-xs text-blue-400 hover:text-blue-300 font-semibold underline">
+                                Clear (Auto-Detect Beacon Wallet)
+                            </button>
+                        </div>
+                        <input type="text" x-model="form.live.funder_address"
+                               autocomplete="off" spellcheck="false"
+                               class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition font-mono text-xs sm:text-sm"
+                               placeholder="0x... your deposit wallet address from polymarket.com (leave blank to auto-derive)">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">
+                            Your actual Polymarket deposit wallet address (from polymarket.com deposit screen). If left blank, the bot automatically derives your <strong>Beacon Proxy Deposit Wallet</strong> (for accounts created after June 29, 2026) and scans legacy wallets.
+                        </p>
+                    </div>
                     <div class="p-3 rounded-lg bg-gray-900/50 border border-gray-700">
                         <p class="text-[11px] text-gray-400 leading-relaxed">
                             <strong class="text-blue-400 uppercase">CLOB V2 — deposit wallet.</strong>
@@ -469,7 +486,7 @@
                                         <div class="flex items-center justify-between gap-2 mb-1.5">
                                             <span class="text-xs font-bold"
                                                   :class="w.address === chosenFunder ? 'text-emerald-400' : 'text-gray-300'"
-                                                  x-text="(w.address === chosenFunder ? '✓ ACTIVE TRADING WALLET: ' : '') + labelFor(w.signature_type)"></span>
+                                                  x-text="(w.address === chosenFunder ? '✓ ACTIVE TRADING WALLET: ' : '') + labelFor(w.signature_type, w)"></span>
                                             <span class="text-xs font-mono font-bold"
                                                   :class="w.pusd_balance > 0 ? 'text-emerald-400' : 'text-gray-500'"
                                                   x-text="w.pusd_balance == null ? 'balance ?' : ('$' + Number(w.pusd_balance).toFixed(2) + ' pUSD')"></span>
@@ -588,7 +605,7 @@
                     polymarket: { series_id: '' },
                     trading: { symbol: '', risk_type: 'percent', risk_value: 10 },
                     ev: { ev_threshold: 0.04, min_prob: 0.55, min_book_liquidity_usd: 20.0 },
-                    live: { relayer_api_key: '', alchemy_api_key: '', max_slippage: 0.02 },
+                    live: { relayer_api_key: '', alchemy_api_key: '', funder_address: '', max_slippage: 0.02 },
                     flip: { enabled: false, min_conviction: 0.80, min_minutes_left: 9.0 },
                     capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted', default_destination: '' },
                     telegram: { enabled: false, bot_token: '' }
@@ -728,8 +745,9 @@
                         setTimeout(() => this.message = '', 3000);
                     }
                 },
-                labelFor(t) {
-                    return t === 3 ? 'Deposit (V2)' : (t === 1 ? 'Poly proxy' : (t === 2 ? 'Safe proxy' : 'Wallet ' + t));
+                labelFor(t, w) {
+                    if (w && w.label) return w.label;
+                    return t === 3 ? 'Deposit Wallet (V2)' : (t === 1 ? 'Poly Proxy' : (t === 2 ? 'Safe Proxy' : (t === 0 ? 'Personal Signer EOA' : 'Wallet ' + t)));
                 },
                 async testConnection() {
                     this.walletBusy = 'test';
@@ -756,6 +774,7 @@
                             private_key: this.form.private_key,
                             relayer_api_key: this.form.live?.relayer_api_key || '',
                             alchemy_api_key: this.form.live?.alchemy_api_key || '',
+                            funder_address: (this.form.live?.funder_address || '').trim(),
                             withdraw_address: customWithdraw,
                             withdraw_enabled: !!this.form.capital_extractor?.enabled,
                             withdraw_amount: this.form.capital_extractor?.withdraw_amount,
