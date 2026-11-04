@@ -117,14 +117,20 @@ def flatten_event_markets(events: List[Dict]) -> List[Dict]:
     return markets
 
 async def fetch_clob_price(token_id: str, side: str = "buy") -> Optional[float]:
+    if not token_id:
+        return None
     url = f"{settings.CLOB_BASE_URL}/price"
     params = {"token_id": token_id, "side": side}
     proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
-        res = await client.get(url, params=params)
-        res.raise_for_status()
-        data = res.json()
-        return to_number(data.get("price"))
+    try:
+        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=3.0) as client:
+            res = await client.get(url, params=params)
+            if res.status_code == 200:
+                data = res.json()
+                return to_number(data.get("price"))
+    except Exception:
+        pass
+    return None
 
 async def fetch_order_book(token_id: str) -> Dict:
     url = f"{settings.CLOB_BASE_URL}/book"

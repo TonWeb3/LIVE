@@ -764,17 +764,45 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 await broadcast_state()
                 break
 
-            # 2. Get freshest book ask for this token (attempt #1 uses evaluated_price instantly with 0ms RAM lookup)
+            # 2. Get freshest book ask for this token:
+            # Attempt #1 uses evaluated_price instantly with 0ms RAM lookup.
+            # Subsequent attempts (re-quotes) MUST refresh the live ask from WebSocket and live CLOB REST API!
             if attempt_num == 1 and evaluated_price and evaluated_price > 0:
                 current_ask = evaluated_price
                 cur_ask_liq_usd = ask_liq_usd
             else:
-                summary = polymarket_clob_ws.get_summary(token_id, max_age_s=3.0)
+                # Priority 1: WebSocket cache with relaxed age window
+                summary = polymarket_clob_ws.get_summary(token_id, max_age_s=15.0)
                 current_ask = summary.get("bestAsk") if summary else None
+                ask_liq_sh = summary.get("askLiquidity") if summary else None
+                cur_ask_liq_usd = (ask_liq_sh * current_ask) if (ask_liq_sh is not None and current_ask and current_ask > 0) else None
+
+                # Priority 2: Direct query to CLOB API to guarantee 100% fresh on-exchange live price
+                if not current_ask or current_ask <= 0:
+                    try:
+                        from bot.data import fetch_clob_price
+                        clob_p = await fetch_clob_price(token_id, "buy")
+                        if clob_p and clob_p > 0:
+                            current_ask = float(clob_p)
+                    except Exception:
+                        pass
+
+                # Priority 3: Check raw WebSocket book without age filtering
+                if not current_ask or current_ask <= 0:
+                    raw_book = polymarket_clob_ws.get_token_market(token_id)
+                    asks = raw_book.get("asks", [])
+                    if asks:
+                        try:
+                            current_ask = float(asks[0].get("px", asks[0]["price"]))
+                        except Exception:
+                            pass
+
+                # Priority 4: Fallback to initial price only if all real-time network/cache sources failed
                 if not current_ask or current_ask <= 0:
                     current_ask = evaluated_price or trade.get("paper_entry_price") or 0.50
-                ask_liq_sh = summary.get("askLiquidity") if summary else None
-                cur_ask_liq_usd = (ask_liq_sh * current_ask) if (ask_liq_sh is not None and current_ask > 0) else ask_liq_usd
+
+                if cur_ask_liq_usd is None or cur_ask_liq_usd <= 0:
+                    cur_ask_liq_usd = ask_liq_usd
 
             # 3. Sizing: Instant RAM lookup of precomputed stake from background updater (0ms latency)
             live_balance = state.get("live_balance") or 0.0
@@ -910,6 +938,20 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     if st == "CANCELLED":
                         await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         return
+
+                    # Check if market ask has surged above our resting limit price
+                    # If market jumped away, cancel early to re-quote at the higher price instead of waiting 4s passively
+                    if now_ts - order_placed_ts >= 1.5:
+                        ws_sum = polymarket_clob_ws.get_summary(token_id, max_age_s=5.0)
+                        ws_ask = ws_sum.get("bestAsk") if ws_sum else None
+                        if ws_ask and ws_ask > gtd_price:
+                            log_message(f"Market ask surged ({ws_ask:.4f} > limit {gtd_price:.4f}) — cancelling resting GTD early to re-quote at fresh ask...")
+                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
+                            if filled:
+                                return
+                            if attempt_num < max_attempts:
+                                trade["live_status"] = "FILLING"
+                                break
 
                     # 4-Second Resting Lifetime:
                     # Enforce the full 4.0s resting window. Once reached, cancel and verify all partial fills!
