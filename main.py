@@ -2355,7 +2355,14 @@ async def stop_trading():
 
 @app.get("/api/available-series")
 async def get_available_series():
-    return await data.fetch_available_15m_series()
+    try:
+        return await data.fetch_available_15m_series()
+    except Exception as e:
+        print(f"Error fetching available series: {e}")
+        return [
+            {"series_id": "10192", "title": "Bitcoin Up or Down 15m"},
+            {"series_id": "10212", "title": "Ethereum Up or Down 15m"}
+        ]
 
 
 @app.get("/api/telegram-subscribers")

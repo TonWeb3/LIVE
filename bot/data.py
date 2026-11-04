@@ -175,3 +175,77 @@ def summarize_order_book(book: Dict) -> Dict:
         "bidLiquidity": bid_liq,
         "askLiquidity": ask_liq
     }
+
+async def fetch_available_15m_series() -> List[Dict]:
+    url = f"{settings.GAMMA_BASE_URL}/events"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "limit": 100,
+        "tag_id": "102467" # 15M tag
+    }
+    proxy = get_proxy_url_for(url)
+    events = []
+    try:
+        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
+            res = await client.get(url, params=params)
+            if res.status_code == 200:
+                events = res.json()
+    except Exception:
+        events = []
+
+    series_map = {}
+    defaults = {
+        "10192": "Bitcoin Up or Down 15m",
+        "10212": "Ethereum Up or Down 15m"
+    }
+    for sid, name in defaults.items():
+        series_map[sid] = {"series_id": sid, "title": name}
+
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        series_slug = e.get("seriesSlug", "") or ""
+        if "up-or-down-15m" in series_slug:
+            sid = e.get("series_id")
+            if not sid and e.get("series") and isinstance(e["series"], list) and len(e["series"]) > 0:
+                sid = e["series"][0].get("id")
+
+            if sid:
+                asset = series_slug.split("-")[0].upper()
+                series_map[str(sid)] = {
+                    "series_id": str(sid),
+                    "title": f"{asset} Up or Down 15m",
+                    "slug": series_slug
+                }
+
+    return sorted(list(series_map.values()), key=lambda x: x["title"])
+
+
+def sweep_sell(bids: List[Dict], size: float) -> Optional[float]:
+    """Calculate the effective VWAP sell price for `size` shares against order book bids.
+    Returns None if book has 0 liquidity."""
+    if not bids or size <= 0:
+        return None
+    sorted_bids = []
+    for b in bids:
+        p = to_number(b.get("price"))
+        s = to_number(b.get("size"))
+        if p is not None and s is not None and s > 0:
+            sorted_bids.append((p, s))
+    sorted_bids.sort(key=lambda x: x[0], reverse=True)
+
+    rem = size
+    total_val = 0.0
+    total_size = 0.0
+    for p, s in sorted_bids:
+        take = min(rem, s)
+        total_val += take * p
+        total_size += take
+        rem -= take
+        if rem <= 0:
+            break
+    if total_size <= 0:
+        return None
+    return total_val / total_size
+
