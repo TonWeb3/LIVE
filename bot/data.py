@@ -4,8 +4,8 @@ from typing import List, Dict, Optional
 from .net_utils import get_proxy_url_for
 
 BINANCE_REST_HOSTS = [
-    "https://data-api.binance.vision",
     "https://api.binance.com",
+    "https://data-api.binance.vision",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com"
@@ -37,7 +37,7 @@ async def fetch_klines(symbol: str, interval: str, limit: int) -> List[Dict]:
         url = f"{host}/api/v3/klines"
         proxy = get_proxy_url_for(url)
         try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
                 res = await client.get(url, params=params)
                 if res.status_code != 200:
                     continue
@@ -76,7 +76,7 @@ async def fetch_last_price(symbol: str) -> Optional[float]:
         url = f"{host}/api/v3/ticker/price"
         proxy = get_proxy_url_for(url)
         try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=3.0) as client:
+            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=8.0) as client:
                 res = await client.get(url, params=params)
                 if res.status_code == 200:
                     data = res.json()
@@ -120,7 +120,7 @@ async def fetch_clob_price(token_id: str, side: str = "buy") -> Optional[float]:
     url = f"{settings.CLOB_BASE_URL}/price"
     params = {"token_id": token_id, "side": side}
     proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
+    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
         res = await client.get(url, params=params)
         res.raise_for_status()
         data = res.json()
@@ -130,7 +130,7 @@ async def fetch_order_book(token_id: str) -> Dict:
     url = f"{settings.CLOB_BASE_URL}/book"
     params = {"token_id": token_id}
     proxy = get_proxy_url_for(url)
-    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
+    async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
         res = await client.get(url, params=params)
         res.raise_for_status()
         return res.json()

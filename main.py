@@ -1690,6 +1690,17 @@ async def update_loop():
             klines_5m = binance_kline_5m.get_candles()
 
             spot_price = binance_ws.get("price") if binance_ws and binance_ws.get("price") else last_price
+            if spot_price:
+                state["last_spot_price"] = spot_price
+            else:
+                spot_price = state.get("last_spot_price")
+
+            # Auto-heal kline buffers if empty or low
+            if len(klines_1m) < 15 or len(klines_5m) < 15:
+                now_t = time.time()
+                if now_t - state.get("_last_seed_kline_ts", 0) > 10.0:
+                    state["_last_seed_kline_ts"] = now_t
+                    asyncio.create_task(seed_kline_buffers())
 
             mc_steps = max(1, math.ceil(timing["remainingMinutes"] / 5))
 
@@ -1776,8 +1787,17 @@ async def update_loop():
             if len(klines_5m) >= 20:
                 consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
 
-            market_up = poly_snapshot["prices"]["up"] if poly_snapshot["ok"] else None
-            market_down = poly_snapshot["prices"]["down"] if poly_snapshot["ok"] else None
+            market_up = poly_snapshot.get("prices", {}).get("up") if poly_snapshot.get("ok") else None
+            market_down = poly_snapshot.get("prices", {}).get("down") if poly_snapshot.get("ok") else None
+            if market_up is not None:
+                state["last_poly_up"] = market_up
+            else:
+                market_up = state.get("last_poly_up")
+
+            if market_down is not None:
+                state["last_poly_down"] = market_down
+            else:
+                market_down = state.get("last_poly_down")
 
             market_implied_up = None
             if market_up is not None and market_down is not None and (market_up + market_down) > 0:
@@ -1975,24 +1995,14 @@ async def update_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
-    await seed_kline_buffers()
-    # Pre-warm CLOB trader client, on-chain approvals & TLS connection pool at startup
-    if settings.PRIVATE_KEY:
-        await asyncio.to_thread(clob_trader.ensure_ready)
-        if settings.RELAYER_API_KEY:
-            try:
-                setup_res = await asyncio.to_thread(clob_trader.ensure_setup)
-                log_message(f"Startup on-chain wallet verification: {setup_res}")
-            except Exception as e:
-                log_message(f"Startup on-chain wallet verification note: {e}")
 
-    # ── High-Performance Memory & Garbage Collection Optimization ──
-    # Collect all startup allocations and freeze existing long-lived objects in gen 2,
-    # so GC never traverses imported modules, compiled regexes, or initial state objects.
-    # Raise gen 0 threshold to 50,000 to prevent GC pauses during sub-millisecond tick bursts.
-    import gc
-    gc.collect()
+    # Pre-seed cached spot price from last run if available
+    if not state.get("last_spot_price"):
+        cached_p = state.get("latest_data", {}).get("prices", {}).get("spot")
+        if cached_p:
+            state["last_spot_price"] = cached_p
 
+    # Start all background tasks immediately so WebSockets stream without blocking
     tasks = [
         asyncio.create_task(binance_stream.start()),
         asyncio.create_task(binance_kline_1m.start()),
@@ -2005,6 +2015,27 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(telegram_poller()),
         asyncio.create_task(entry_watcher())
     ]
+
+    # Concurrently seed kline buffers in background
+    asyncio.create_task(seed_kline_buffers())
+
+    # Pre-warm CLOB trader client & on-chain verification in background thread if private key set
+    if settings.PRIVATE_KEY:
+        async def _warm_live():
+            try:
+                await asyncio.to_thread(clob_trader.ensure_ready)
+                if settings.RELAYER_API_KEY:
+                    try:
+                        setup_res = await asyncio.to_thread(clob_trader.ensure_setup)
+                        log_message(f"Startup on-chain wallet verification: {setup_res}")
+                    except Exception as e:
+                        log_message(f"Startup on-chain wallet verification note: {e}")
+            except Exception as e:
+                log_message(f"Live trader pre-warm note: {e}")
+        asyncio.create_task(_warm_live())
+
+    import gc
+    gc.collect()
 
     yield
 

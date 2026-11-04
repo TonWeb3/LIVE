@@ -24,8 +24,8 @@ except ImportError:
 
 class BinanceTradeStream:
     """Ultra-fast spot + futures leading price feed from Binance.
-    Listens to Binance Spot (@bookTicker and @trade). Computes real-time mid-price
-    from best bid and ask on every order book change with zero basis skew."""
+    Listens to Binance Futures (@bookTicker and @trade) which leads spot price discovery
+    by 30ms-80ms, with seamless fallback/redundancy to Binance Spot (@bookTicker and @trade)."""
     def __init__(self, symbol: str, on_update: Optional[Callable] = None):
         self.symbol = symbol.lower()
         self.on_update = on_update
@@ -34,12 +34,12 @@ class BinanceTradeStream:
         self.last_source = None
         self.closed = False
 
-    async def _spot_book_worker(self):
-        """Binance Spot feed (@bookTicker) — fast mid-price on Spot index.
-        The mid-price of best bid and ask updates on every book change with zero basis skew."""
+    async def _futures_worker(self):
+        """Binance USDT-M Futures feed (@bookTicker) - the leading edge signal.
+        The mid-price of best bid and ask updates before spot trades print."""
         endpoints = [
-            f"wss://stream.binance.com:9443/ws/{self.symbol}@bookTicker",
-            f"wss://data-stream.binance.vision/ws/{self.symbol}@bookTicker"
+            f"wss://fstream.binance.com/ws/{self.symbol}@bookTicker",
+            f"wss://fstream.binance.com/ws/{self.symbol}@trade"
         ]
         endpoint_idx = 0
         while not self.closed:
@@ -47,14 +47,57 @@ class BinanceTradeStream:
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=20.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(url, heartbeat=15.0, proxy=proxy if proxy else None) as ws:
+                        print(f"Connected to Binance Futures Lead WS: {self.symbol}@bookTicker")
+                        while not self.closed:
+                            msg = await ws.receive()
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data_msg = fast_loads(msg.data)
+                                if "b" in data_msg and "a" in data_msg:
+                                    try:
+                                        bid = float(data_msg["b"])
+                                        ask = float(data_msg["a"])
+                                        if bid > 0 and ask > 0:
+                                            mid = (bid + ask) / 2.0
+                                            self._process_trade(mid, source="binance_futures_book")
+                                    except (TypeError, ValueError):
+                                        pass
+                                elif "p" in data_msg:
+                                    try:
+                                        p = float(data_msg["p"])
+                                        if p > 0:
+                                            self._process_trade(p, source="binance_futures_trade")
+                                    except (TypeError, ValueError):
+                                        pass
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                                break
+            except Exception as e:
+                if not self.closed:
+                    await asyncio.sleep(2)
+
+    async def _spot_book_worker(self):
+        """Binance Spot feed (@bookTicker) - fast mid-price on Spot index.
+        The mid-price of best bid and ask updates on every book change with zero basis skew."""
+        endpoints = [
+            f"wss://data-stream.binance.vision/ws/{self.symbol}@bookTicker",
+            f"wss://stream.binance.com:9443/ws/{self.symbol}@bookTicker"
+        ]
+        endpoint_idx = 0
+        while not self.closed:
+            url = endpoints[endpoint_idx % len(endpoints)]
+            endpoint_idx += 1
+            try:
+                proxy = get_proxy_url_for(url)
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=20.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(url, heartbeat=15.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot Book WS ({url}): {self.symbol}@bookTicker")
                         while not self.closed:
                             msg = await ws.receive()
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 data_msg = fast_loads(msg.data)
-                                # @bookTicker payload: {"b": best_bid, "a": best_ask}
                                 if "b" in data_msg and "a" in data_msg:
                                     try:
                                         bid = float(data_msg["b"])
@@ -64,14 +107,14 @@ class BinanceTradeStream:
                                             self._process_trade(mid, source="binance_spot_book")
                                     except (TypeError, ValueError):
                                         pass
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 break
             except Exception as e:
                 if not self.closed:
                     await asyncio.sleep(2)
 
     async def _spot_worker(self):
-        """Binance Spot feed (@trade) — robust fallback and spot anchor."""
+        """Binance Spot feed (@trade) - robust fallback and spot anchor."""
         endpoints = [
             f"wss://data-stream.binance.vision/ws/{self.symbol}@trade",
             f"wss://stream.binance.com:9443/ws/{self.symbol}@trade"
@@ -82,8 +125,9 @@ class BinanceTradeStream:
             endpoint_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=20.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(url, heartbeat=15.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Binance Spot WS ({url}): {self.symbol}")
                         while not self.closed:
                             msg = await ws.receive()
@@ -96,15 +140,16 @@ class BinanceTradeStream:
                                             self._process_trade(p, source="binance_spot_trade")
                                     except (TypeError, ValueError):
                                         pass
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 break
             except Exception as e:
                 if not self.closed:
                     await asyncio.sleep(2)
 
     async def start(self):
-        # Run both Futures (leading edge) and Spot (redundancy) concurrently
+        # Run Futures (leading edge), Spot Book, and Spot Trades concurrently
         await asyncio.gather(
+            self._futures_worker(),
             self._spot_book_worker(),
             self._spot_worker(),
             return_exceptions=True
@@ -150,6 +195,10 @@ class BinanceKlineStream:
         ]
         endpoint_idx = 0
 
+        # Proactively backfill if candles are missing or insufficient
+        if len(self.candles) < 20:
+            asyncio.create_task(self._backfill_gap())
+
         while not self.closed:
             url = endpoints[endpoint_idx % len(endpoints)]
             endpoint_idx += 1
@@ -187,6 +236,7 @@ class BinanceKlineStream:
     def _update_candle(self, candle: Dict):
         if not self.candles:
             self.candles.append(candle)
+            asyncio.create_task(self._backfill_gap())
             return
 
         last = self.candles[-1]
@@ -195,8 +245,10 @@ class BinanceKlineStream:
 
         if c_open == l_open:
             self.candles[-1] = candle
+            if len(self.candles) < 20:
+                asyncio.create_task(self._backfill_gap())
         elif c_open > l_open:
-            if (c_open - l_open) > (self._step_ms * 1.5):
+            if (c_open - l_open) > (self._step_ms * 1.5) or len(self.candles) < 20:
                 asyncio.create_task(self._backfill_gap())
             self.candles.append(candle)
             if len(self.candles) > self.limit:
