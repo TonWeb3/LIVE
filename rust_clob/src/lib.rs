@@ -160,16 +160,11 @@ fn build_signed_order_internal(
         (frac * (timestamp_ms as f64)) as u64
     });
 
-    let signer_bytes = if st.signature_type == 3 {
-        &st.funder_bytes
-    } else {
-        &st.eoa_bytes
-    };
-    let signer_checksum = if st.signature_type == 3 {
-        &st.funder_checksum
-    } else {
-        &st.eoa_checksum
-    };
+    // Polymarket CLOB V2 rule: order.signer MUST match the EOA address that derived
+    // and owns the L2 API Key (POLY_ADDRESS header).
+    // order.maker is st.funder_checksum (the deposit wallet, proxy, safe, or EOA).
+    let signer_bytes = &st.eoa_bytes;
+    let signer_checksum = &st.eoa_checksum;
 
     let token_id_be = parse_u256_be(token_id)?;
 
@@ -203,7 +198,8 @@ fn build_signed_order_internal(
         solady_buf[64..96].copy_from_slice(&st.deposit_name_hash);
         solady_buf[96..128].copy_from_slice(&st.deposit_version_hash);
         solady_buf[152..160].copy_from_slice(&st.chain_id.to_be_bytes());
-        solady_buf[172..192].copy_from_slice(signer_bytes);
+        // Word 5 (160..192): verifyingContract in Solady is the deposit wallet contract
+        solady_buf[172..192].copy_from_slice(&st.funder_bytes);
         // word 6 (192..224) = DEPOSIT_WALLET_DOMAIN_SALT (0x00..00)
 
         let typed_data_sign_hash = keccak256(&solady_buf);
