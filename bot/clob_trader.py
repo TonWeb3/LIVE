@@ -82,6 +82,9 @@ def _patch_order_builder():
             return res_side, maker, taker
 
         OrderBuilder.get_market_order_amounts = safe_get_market_order_amounts
+
+        # Polymarket CLOB V2 rule: order.signer MUST match the EOA owning the API key
+        OrderBuilder._v2_order_signer = lambda self: self.signer.address()
     except Exception as e:
         print(f"Warning: Failed to patch OrderBuilder: {e}")
 
@@ -306,6 +309,15 @@ class ClobTrader:
                     out.append((st, addr))
             except Exception:
                 pass
+
+        # Include direct EOA (st=0) for standard web3 accounts
+        try:
+            from eth_account import Account
+            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
+            if eoa_addr and not any(a.lower() == eoa_addr.lower() for _, a in out):
+                out.append((0, eoa_addr))
+        except Exception:
+            pass
 
         # 2. Check previous active maker address from CLOB trades if not already in candidates
         try:
