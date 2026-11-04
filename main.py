@@ -71,20 +71,25 @@ def _sync_active_trades_to_latest_data():
         ts["has_live_creds"] = bool(settings.PRIVATE_KEY)
 
 _last_spot_broadcast_ts = 0.0
+_last_broadcast_spot_price = 0.0
 
 def _wake_entry(data_payload=None):
-    global _last_spot_broadcast_ts
+    global _last_spot_broadcast_ts, _last_broadcast_spot_price
     _market_event.set()
     if data_payload and isinstance(data_payload, dict):
+        source = str(data_payload.get("source", ""))
         p = data_payload.get("price")
         if p and p > 0:
-            state["last_spot_price"] = p
-            prices = state.setdefault("latest_data", {}).setdefault("prices", {})
-            prices["spot"] = p
-            now = time.time()
-            if now - _last_spot_broadcast_ts >= 0.08 and _ws_clients:
-                _last_spot_broadcast_ts = now
-                asyncio.create_task(broadcast_state())
+            if "spot" in source or not state.get("last_spot_price"):
+                state["last_spot_price"] = p
+                prices = state.setdefault("latest_data", {}).setdefault("prices", {})
+                prices["spot"] = p
+                now = time.time()
+                if (now - _last_spot_broadcast_ts >= 0.25 and _ws_clients
+                        and abs(p - _last_broadcast_spot_price) >= 0.01):
+                    _last_spot_broadcast_ts = now
+                    _last_broadcast_spot_price = p
+                    asyncio.create_task(broadcast_state())
 
 def _on_chainlink_tick(data_payload=None):
     if data_payload and isinstance(data_payload, dict):
@@ -465,6 +470,10 @@ _cached_market_series = ""
 async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
     global _cached_market, _cached_market_ts, _cached_market_series
     now = time.time()
+    now_ms = now * 1000
+    timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+    cur_start_ms = timing["startMs"]
+
     curr_target = settings.POLYMARKET_SLUG or settings.POLYMARKET_SERIES_ID
     if not force and _cached_market and _cached_market_series == curr_target:
         end_date = _cached_market.get("endDate")
@@ -475,8 +484,6 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
                     return _cached_market
             except Exception:
                 pass
-        elif (now - _cached_market_ts) < 30.0:
-            return _cached_market
 
     market = None
     try:
@@ -485,14 +492,32 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         elif settings.POLYMARKET_AUTO_SELECT_LATEST:
             events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
             markets = data.flatten_event_markets(events)
-            now_ms = now * 1000
-            live_markets = [
-                m for m in markets
-                if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now_ms
-            ]
+            live_markets = []
+            for m in markets:
+                end_str = m.get("endDate")
+                if not end_str:
+                    continue
+                try:
+                    end_m_ts = datetime.fromisoformat(end_str.replace('Z', '+00:00')).timestamp() * 1000
+                except Exception:
+                    continue
+                if end_m_ts <= now_ms + 15_000:
+                    continue
+                esr = m.get("eventStartTime") or m.get("gameStartTime")
+                start_m_ts = None
+                if esr:
+                    try:
+                        start_m_ts = datetime.fromisoformat(str(esr).replace('Z', '+00:00')).timestamp() * 1000
+                    except Exception:
+                        pass
+                if start_m_ts is None:
+                    start_m_ts = end_m_ts - (settings.CANDLE_WINDOW_MINUTES * 60_000)
+                if abs(start_m_ts - cur_start_ms) < 120_000 or (start_m_ts <= now_ms < end_m_ts):
+                    live_markets.append((m, end_m_ts, abs(start_m_ts - cur_start_ms)))
+
             if live_markets:
-                live_markets.sort(key=lambda x: x["endDate"])
-                market = live_markets[0]
+                live_markets.sort(key=lambda x: (x[2], x[1]))
+                market = live_markets[0][0]
     except Exception as e:
         print(f"Warning: Market discovery error: {e}")
 
@@ -502,20 +527,8 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         _cached_market_series = curr_target
         return market
 
-    # If discovery returned nothing, verify if existing cached market is still unexpired
-    if _cached_market:
-        end_date = _cached_market.get("endDate")
-        if end_date:
-            try:
-                end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
-                if end_ts > now:
-                    return _cached_market
-            except Exception:
-                pass
-        # Expired or invalid cache: purge it so we don't pin to a dead market!
-        _cached_market = None
-        _cached_market_ts = 0.0
-
+    _cached_market = None
+    _cached_market_ts = 0.0
     return None
 
 async def fetch_polymarket_snapshot() -> Dict[str, Any]:
@@ -1586,6 +1599,10 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
     _mslug = str(_mkt.get("slug") or "")
     _sms = ctx.get("start_ms")
 
+    timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+    if _sms is not None and int(_sms) != int(timing["startMs"]):
+        return "window_expired"
+
     # In-flight check for this market
     if (_mid and _mid in _in_flight_markets) or (_mslug and _mslug in _in_flight_markets):
         return "slot_busy"
@@ -1620,6 +1637,31 @@ async def evaluate_entry(reason: str = "event"):
         ctx = state.get("trade_ctx")
         if not ctx:
             return
+
+        timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+        cur_start_ms = timing["startMs"]
+
+        # Strict window check: never evaluate trades using stale previous window context!
+        if ctx.get("start_ms") != cur_start_ms:
+            state["trade_ctx"] = None
+            return
+
+        # Strict market expiry check
+        mkt = ctx.get("market") or {}
+        end_date = mkt.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(str(end_date).replace('Z', '+00:00')).timestamp()
+                if now >= end_ts - 5.0:
+                    state["trade_ctx"] = None
+                    return
+            except Exception:
+                pass
+
+        if not ctx.get("strike_open") or not ctx.get("target_open"):
+            state["trade_ctx"] = None
+            return
+
         if now - ctx.get("built_at", 0) > CTX_MAX_AGE_S:
             return
 
@@ -1760,6 +1802,21 @@ async def update_loop():
     while True:
         try:
             timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+            cur_window_start_ms = int(timing["startMs"])
+            prev_window_start_ms = state.get("last_window_start")
+
+            # ── WINDOW ROLLOVER DETECTED ──
+            # A new 15-minute window has begun (:00, :15, :30, :45).
+            # Purge all stale context, cached market, and previous window odds immediately
+            # so the bot NEVER uses old window data to calculate signals or enter trades!
+            if prev_window_start_ms is not None and cur_window_start_ms != prev_window_start_ms:
+                state["trade_ctx"] = None
+                _cached_market = None
+                _cached_market_ts = 0.0
+                state["last_poly_up"] = None
+                state["last_poly_down"] = None
+                polymarket_clob_ws.reset_books()
+                log_message(f"Window rollover detected: new window started at {datetime.fromtimestamp(cur_window_start_ms / 1000).strftime('%H:%M:%S')}. Cleared old window context.")
 
             binance_ws = binance_stream.get_last()
             if not binance_ws.get("price"):
@@ -1854,26 +1911,17 @@ async def update_loop():
             model_open = model_open or win.get("binance") or spot_price
             target_open = model_open if strike_open is not None else None
 
-            drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
-            fair_data = {
-                "prob_up": fair_up,
-                "prob_down": 1.0 - fair_up,
-                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
-                "sigma_5m": sigma_5m,
-            }
-
             settlement_ms = None
             if poly_snapshot.get("ok") and poly_snapshot.get("market") and poly_snapshot["market"].get("endDate"):
                 try:
                     settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
+                    if settlement_ms <= time.time() * 1000:
+                        poly_snapshot["ok"] = False
                 except Exception:
                     settlement_ms = None
 
             now_ms = time.time() * 1000
             if settlement_ms is not None:
-                # If market has a known settlement timestamp, respect it strictly: expired means 0.0 minutes left!
                 time_left_min = max(0.0, (settlement_ms - now_ms) / 60_000)
             else:
                 time_left_min = max(0.0, timing["remainingMinutes"])
@@ -1910,13 +1958,6 @@ async def update_loop():
             market_implied_up = None
             if market_up is not None and market_down is not None and (market_up + market_down) > 0:
                 market_implied_up = market_up / (market_up + market_down)
-            edge = {
-                "marketUp": market_implied_up,
-                "marketDown": (1 - market_implied_up) if market_implied_up is not None else None,
-                "edgeUp": (fair_up - market_implied_up) if market_implied_up is not None else None,
-                "edgeDown": ((1 - fair_up) - (1 - market_implied_up)) if market_implied_up is not None else None,
-            }
-            prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
             EB = engines.EXHAUSTION_BARS
             def _is(color, count, want):
@@ -1925,20 +1966,47 @@ async def update_loop():
             ha_exhausted_green = _is(consec["color"], consec["count"], "green") or _is(consec_5m["color"], consec_5m["count"], "green")
             ha_exhausted_red = _is(consec["color"], consec["count"], "red") or _is(consec_5m["color"], consec_5m["count"], "red")
 
-            decision = engines.decide_ev({
-                "mcProbUp": fair_up,
-                "priceUp": market_up,
-                "priceDown": market_down,
-                "minProb": settings.MIN_PROB_EV,
-                "evThreshold": settings.EV_THRESHOLD,
-                "rsi": rsi_now,
-                "haExhaustedGreen": ha_exhausted_green,
-                "haExhaustedRed": ha_exhausted_red,
-            })
+            since_start = (time.time() * 1000) - start_ms
+            if strike_open is None or target_open is None:
+                fair_up = 0.50
+                drift_5m, sigma_5m = (0.0, None)
+                if since_start < MARK_CAPTURE_WINDOW_MS:
+                    decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "waiting_new_window_strike"}
+                else:
+                    decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "no_strike_window_skipped"}
+            else:
+                drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
+                fair_up = indicators.fair_prob_up(spot_price or 0, target_open, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
+                decision = engines.decide_ev({
+                    "mcProbUp": fair_up,
+                    "priceUp": market_up,
+                    "priceDown": market_down,
+                    "minProb": settings.MIN_PROB_EV,
+                    "evThreshold": settings.EV_THRESHOLD,
+                    "rsi": rsi_now,
+                    "haExhaustedGreen": ha_exhausted_green,
+                    "haExhaustedRed": ha_exhausted_red,
+                })
 
-            # Publish trade_ctx for event watcher early entries
-            if poly_snapshot.get("ok"):
-                # Pre-warm active market tokens in RAM so fee & tick metadata are 0ms cached
+            fair_data = {
+                "prob_up": fair_up,
+                "prob_down": 1.0 - fair_up,
+                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
+                "steps": mc_steps,
+                "sigma_5m": sigma_5m,
+            }
+
+            edge = {
+                "marketUp": market_implied_up,
+                "marketDown": (1 - market_implied_up) if market_implied_up is not None else None,
+                "edgeUp": (fair_up - market_implied_up) if market_implied_up is not None else None,
+                "edgeDown": ((1 - fair_up) - (1 - market_implied_up)) if market_implied_up is not None else None,
+            }
+            prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
+
+            # Publish trade_ctx ONLY IF new window strike is genuinely captured and market is valid!
+            if (poly_snapshot.get("ok") and strike_open is not None and target_open is not None
+                    and poly_snapshot.get("market") and time_left_min > 0.1):
                 tok_up = poly_snapshot.get("token_ids", {}).get("up")
                 tok_down = poly_snapshot.get("token_ids", {}).get("down")
                 if tok_up:
@@ -1975,13 +2043,15 @@ async def update_loop():
                     "market": poly_snapshot["market"],
                     "market_ok": True,
                     "price_is_fresh": price_is_fresh,
-                    "slot_busy": any(str(t.get("market_id")) == str(poly_snapshot["market"].get("id")) for t in state["active_trades"]) if (poly_snapshot.get("ok") and poly_snapshot.get("market")) else False,
+                    "slot_busy": any(str(t.get("market_id")) == str(poly_snapshot["market"].get("id")) for t in state["active_trades"]),
                 }
+            else:
+                state["trade_ctx"] = None
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
-            if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
+            if poly_snapshot.get("ok") and state["running"] and state["withdraw_state"] != "in_progress":
                 flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
                 exec_result = await execute_trade(
                     decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
@@ -2034,7 +2104,21 @@ async def update_loop():
                     t["live_mark_price"] = None
                     t["live_unrealized_pl"] = None
 
-            # Live balance maintained with 0ms delay by background live_balance_updater
+            # Live balance refresh: every 30 seconds directly in update_loop (safe, debounced, never hangs)
+            if settings.PRIVATE_KEY:
+                now_ts = time.time()
+                if now_ts - state.get("last_balance_refresh", 0) > 30.0:
+                    state["last_balance_refresh"] = now_ts
+                    real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
+                    if real_bal is not None:
+                        state["live_balance"] = real_bal
+                        risk_type = (settings.RISK_TYPE or "percent").lower()
+                        if risk_type == "fixed":
+                            stake = float(settings.RISK_VALUE)
+                        else:
+                            stake = (float(settings.RISK_VALUE) / 100.0) * real_bal
+                        state["precomputed_live_stake"] = round(max(1.0, min(stake, real_bal)) if real_bal >= 1.0 else 0.0, 2)
+
             live_balance = float(state.get("live_balance") or 0.0)
             total_equity = live_balance + live_open_value
             await maybe_auto_withdraw(total_equity, poly_snapshot)
@@ -2122,7 +2206,6 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(polymarket_clob_ws.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
-        asyncio.create_task(live_balance_updater()),
         asyncio.create_task(telegram_poller()),
         asyncio.create_task(entry_watcher())
     ]

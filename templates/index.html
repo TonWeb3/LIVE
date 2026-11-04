@@ -475,7 +475,7 @@
                         this.lastLogSeq = seq;
                         if (this.tab === 'logs') this.refreshLogs();
                     }
-                    if (this.tab === 'history') this.loadHistory();
+                    if (this.tab === 'history' && (!this.tradeHistory || !this.tradeHistory.length || seq !== this.lastLogSeq)) this.loadHistory();
                 },
                 async loadHistory() {
                     try { this.tradeHistory = (await (await fetch('/history')).json()).reverse(); }

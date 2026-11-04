@@ -198,6 +198,9 @@ class ClobTrader:
         self._approvals_done = False
         self._api_creds = None
         self._rust_ready = False
+        self._cached_balance = None
+        self._last_balance_ts = 0.0
+        self._balance_fetching = False
         self._lock = threading.Lock()
 
     def reset(self):
@@ -213,6 +216,9 @@ class ClobTrader:
             self._approvals_done = False
             self._api_creds = None
             self._rust_ready = False
+            self._cached_balance = None
+            self._last_balance_ts = 0.0
+            self._balance_fetching = False
 
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
@@ -435,9 +441,6 @@ class ClobTrader:
                 return False
             try:
                 self._init_clients()
-                # Pre-warm native Rust crypto signing context
-                rust_mod = _ensure_rust_clob()
-                _ = rust_mod.build_signed_order("1", 1000000, 1000000, 0, "FAK", "0", False, False, False)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -1000,26 +1003,53 @@ class ClobTrader:
         V2 collateral; this is the deposit wallet's tradeable balance."""
         if not settings.PRIVATE_KEY:
             return None
-        # First priority: Query Polymarket CLOB API directly (accurate for CLOB deposits)
+        now = time.time()
+        if getattr(self, "_cached_balance", None) is not None and (now - getattr(self, "_last_balance_ts", 0)) < 15.0:
+            return self._cached_balance
+
+        if getattr(self, "_balance_fetching", False):
+            return getattr(self, "_cached_balance", None)
+        self._balance_fetching = True
         try:
+            # 1. Direct CLOB API query
             if self.ensure_ready() and self.clob is not None:
-                c_bal = float(self.clob.get_pusd_balance())
-                if c_bal is not None and c_bal >= 0:
-                    return c_bal
-        except Exception:
-            pass
+                try:
+                    c_bal = float(self.clob.get_pusd_balance())
+                    if c_bal is not None and c_bal >= 0:
+                        self._cached_balance = c_bal
+                        self._last_balance_ts = now
+                        return c_bal
+                except Exception:
+                    pass
 
-        # Fallback to gasless / on-chain query (checks both pUSD and USDC.e)
-        try:
+            # 2. Gasless on-chain query if funder is known
             if self.ready and self.gasless is not None and self.funder:
-                p_bal, u_bal = self._get_onchain_balances(self.gasless, self.funder)
-                return max(p_bal, u_bal)
-            probe = self._new_gasless(3)
-            _, funder = self._pick_funded_wallet(probe)
-            p_bal, u_bal = self._get_onchain_balances(probe, funder)
-            return max(p_bal, u_bal)
-        except Exception:
-            return None
+                try:
+                    p_bal, u_bal = self._get_onchain_balances(self.gasless, self.funder)
+                    bal = max(p_bal, u_bal)
+                    self._cached_balance = bal
+                    self._last_balance_ts = now
+                    return bal
+                except Exception:
+                    pass
 
+            # 3. Derive funder once if unknown
+            if not self.funder:
+                try:
+                    probe = self._new_gasless(3)
+                    sig_type, funder = self._pick_funded_wallet(probe)
+                    self.funder = funder
+                    self.signature_type = sig_type
+                    p_bal, u_bal = self._get_onchain_balances(probe, funder)
+                    bal = max(p_bal, u_bal)
+                    self._cached_balance = bal
+                    self._last_balance_ts = now
+                    return bal
+                except Exception:
+                    pass
+
+            return getattr(self, "_cached_balance", None)
+        finally:
+            self._balance_fetching = False
 
 clob_trader = ClobTrader()
