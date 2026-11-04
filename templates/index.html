@@ -75,7 +75,7 @@
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6 mb-6 sm:mb-8">
             <div class="bg-gray-800 p-4 sm:p-6 rounded-lg shadow-lg border-l-4 border-blue-500">
                 <p class="text-gray-400 text-xs sm:text-sm uppercase">BTC Binance Spot</p>
-                <h2 class="text-2xl sm:text-3xl font-mono" x-text="'$' + (data.prices?.spot?.toLocaleString() || '-')"></h2>
+                <h2 class="text-2xl sm:text-3xl font-mono" x-text="data.prices?.spot != null ? ('$' + Number(data.prices.spot).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})) : '$-'"></h2>
             </div>
             <div class="bg-gray-800 p-4 sm:p-6 rounded-lg shadow-lg border-l-4 border-green-500 group relative">
                 <div class="flex justify-between items-start">
@@ -86,7 +86,7 @@
                         </svg>
                     </div>
                 </div>
-                <h2 class="text-2xl sm:text-3xl font-mono" x-text="'$' + (data.prices?.chainlink?.toLocaleString() || '-')"></h2>
+                <h2 class="text-2xl sm:text-3xl font-mono" x-text="data.prices?.chainlink != null ? ('$' + Number(data.prices.chainlink).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})) : '$-'"></h2>
                 <p class="text-[10px] text-gray-500 mt-1 uppercase tracking-tighter" x-text="'Source: ' + (data.prices?.chainlink_source || '-')"></p>
                 <!-- Tooltip -->
                 <div class="absolute z-10 hidden group-hover:block bg-black text-white text-[10px] p-2 rounded shadow-xl border border-gray-700 w-48 -bottom-16 left-0">
@@ -97,7 +97,7 @@
                 <p class="text-gray-400 text-xs sm:text-sm uppercase">Price to Beat (Open)</p>
                 <h2 class="text-2xl sm:text-3xl font-mono"
                     :class="data.prices?.window_open ? 'text-amber-400' : 'text-gray-600'"
-                    x-text="data.prices?.window_open ? ('$' + data.prices.window_open.toLocaleString(undefined, {maximumFractionDigits: 2})) : 'NOT MARKED'"></h2>
+                    x-text="data.prices?.window_open != null ? ('$' + Number(data.prices.window_open).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})) : 'NOT MARKED'"></h2>
                 <p class="text-[10px] mt-1 uppercase tracking-tighter"
                    :class="data.prices?.window_open ? 'text-gray-500' : 'text-red-400'"
                    x-text="data.prices?.window_open ? ('Chainlink @ eventStartTime') : 'No strike — trading skipped this window'"></p>
@@ -141,12 +141,12 @@
                     <div class="flex justify-between text-sm sm:text-base">
                         <span class="text-gray-400">Heiken Ashi (1m)</span>
                         <span :class="data.indicators?.heiken?.color === 'green' ? 'text-green-400' : (data.indicators?.heiken?.color === 'red' ? 'text-red-400' : 'text-gray-500')"
-                              x-text="data.indicators?.heiken?.count != null ? (data.indicators?.heiken?.color + ' x' + data.indicators?.heiken?.count) : '--'"></span>
+                              x-text="data.indicators?.heiken?.color ? (data.indicators.heiken.color + ' x' + data.indicators.heiken.count) : '--'"></span>
                     </div>
                     <div class="flex justify-between text-sm sm:text-base">
                         <span class="text-gray-400">Heiken Ashi (5m)</span>
                         <span :class="data.indicators?.heiken_5m?.color === 'green' ? 'text-green-400' : (data.indicators?.heiken_5m?.color === 'red' ? 'text-red-400' : 'text-gray-500')"
-                              x-text="data.indicators?.heiken_5m?.count != null ? (data.indicators?.heiken_5m?.color + ' x' + data.indicators?.heiken_5m?.count) : '--'"></span>
+                              x-text="data.indicators?.heiken_5m?.color ? (data.indicators.heiken_5m.color + ' x' + data.indicators.heiken_5m.count) : '--'"></span>
                     </div>
                     <div class="flex justify-between text-sm sm:text-base">
                         <span class="text-gray-400">Fair Probability (15m Close)</span>

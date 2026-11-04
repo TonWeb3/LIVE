@@ -187,6 +187,7 @@ class BinanceKlineStream:
         self.closed = False
         self._lock = asyncio.Lock()
         self._step_ms = 60_000 if interval == "1m" else 300_000
+        self._backfilling = False
 
     async def start(self):
         endpoints = [
@@ -245,10 +246,8 @@ class BinanceKlineStream:
 
         if c_open == l_open:
             self.candles[-1] = candle
-            if len(self.candles) < 20:
-                asyncio.create_task(self._backfill_gap())
         elif c_open > l_open:
-            if (c_open - l_open) > (self._step_ms * 1.5) or len(self.candles) < 20:
+            if (c_open - l_open) > (self._step_ms * 1.5) or len(self.candles) < 15:
                 asyncio.create_task(self._backfill_gap())
             self.candles.append(candle)
             if len(self.candles) > self.limit:
@@ -264,14 +263,19 @@ class BinanceKlineStream:
                 self.candles = self.candles[-self.limit:]
 
     async def _backfill_gap(self):
+        if getattr(self, "_backfilling", False):
+            return
+        self._backfilling = True
         try:
             from . import data
             klines = await data.fetch_klines(self.symbol.upper(), self.interval, self.limit)
-            if klines and len(klines) >= 10:
+            if klines and len(klines) >= 15:
                 async with self._lock:
                     self.set_candles(klines)
         except Exception:
             pass
+        finally:
+            self._backfilling = False
 
     def set_candles(self, candles: List[Dict]):
         if not candles:
@@ -318,7 +322,8 @@ class PolymarketChainlinkStream:
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                 }
-                async with aiohttp.ClientSession(headers=headers) as session:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=25.0)
+                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
                     print(f"Connecting to Polymarket WS: {self.ws_url}")
                     async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Polymarket WS. Subscribing to topics...")
@@ -379,7 +384,7 @@ class PolymarketChainlinkStream:
                                     except:
                                         continue
 
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                 break
             except Exception as e:
                 print(f"WS Error (Polymarket): {e}")
@@ -437,7 +442,8 @@ class PolymarketClobMarketStream:
         while not self.closed:
             try:
                 proxy = get_proxy_url_for(self.ws_url)
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=25.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.ws_connect(self.ws_url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         self._ws = ws
                         print(f"Connected to Polymarket CLOB Market WS: {self.ws_url}")
@@ -456,7 +462,7 @@ class PolymarketClobMarketStream:
                                         self._process_msg(data)
                                     except Exception:
                                         continue
-                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                                     break
                         finally:
                             ping_task.cancel()
@@ -663,14 +669,26 @@ class ChainlinkPriceStream:
             return
 
         url_idx = 0
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "eth_call",
+            "params": [
+                {"to": self.aggregator, "data": "0xfeaf968c"},
+                "latest"
+            ]
+        }
+
         while not self.closed:
             url = self.wss_urls[url_idx % len(self.wss_urls)]
             url_idx += 1
             try:
                 proxy = get_proxy_url_for(url)
-                async with aiohttp.ClientSession() as session:
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=8.0, sock_read=30.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.ws_connect(url, heartbeat=20.0, proxy=proxy if proxy else None) as ws:
                         print(f"Connected to Chainlink RPC WS: {url}")
+                        # 1. Subscribe to on-chain AnswerUpdated logs
                         sub_msg = {
                             "jsonrpc": "2.0",
                             "id": 1,
@@ -685,31 +703,71 @@ class ChainlinkPriceStream:
                         }
                         await ws.send_json(sub_msg)
 
-                        while not self.closed:
-                            msg = await ws.receive()
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data_res = fast_loads(msg.data)
-                                if data_res.get("method") == "eth_subscription":
-                                    log = data_res.get("params", {}).get("result", {})
-                                    topics = log.get("topics", [])
-                                    if len(topics) >= 2:
-                                        answer = int(topics[1], 16)
-                                        if answer >= 2**255:
-                                            answer -= 2**256
+                        # 2. Query initial latestRoundData() immediately over WS
+                        await ws.send_json(call_msg)
 
-                                        self.last_price = answer / (10 ** self.decimals)
-                                        data_hex = log.get("data", "0x")
-                                        if len(data_hex) >= 66:
-                                            self.last_updated_at = int(data_hex[2:66], 16) * 1000
-                                        else:
-                                            self.last_updated_at = int(time.time() * 1000)
+                        # 3. Periodic refresh loop over WS to keep sync and serve as keepalive
+                        async def _sync_loop():
+                            while not self.closed:
+                                try:
+                                    await asyncio.sleep(5)
+                                    if not ws.closed:
+                                        await ws.send_json(call_msg)
+                                except Exception:
+                                    break
 
-                                        if self.on_update:
-                                            res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
-                                            if asyncio.iscoroutine(res):
-                                                asyncio.create_task(res)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                                break
+                        sync_task = asyncio.create_task(_sync_loop())
+
+                        try:
+                            while not self.closed:
+                                msg = await ws.receive()
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    data_res = fast_loads(msg.data)
+                                    # Handle AnswerUpdated event logs
+                                    if data_res.get("method") == "eth_subscription":
+                                        log = data_res.get("params", {}).get("result", {})
+                                        topics = log.get("topics", [])
+                                        if len(topics) >= 2:
+                                            answer = int(topics[1], 16)
+                                            if answer >= 2**255:
+                                                answer -= 2**256
+
+                                            self.last_price = answer / (10 ** self.decimals)
+                                            data_hex = log.get("data", "0x")
+                                            if len(data_hex) >= 66:
+                                                self.last_updated_at = int(data_hex[2:66], 16) * 1000
+                                            else:
+                                                self.last_updated_at = int(time.time() * 1000)
+
+                                            if self.on_update:
+                                                res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
+                                                if asyncio.iscoroutine(res):
+                                                    asyncio.create_task(res)
+
+                                    # Handle latestRoundData() eth_call response
+                                    elif data_res.get("id") == 2 or (isinstance(data_res.get("result"), str) and len(data_res.get("result", "")) >= 130):
+                                        res_hex = data_res.get("result", "")
+                                        if isinstance(res_hex, str) and len(res_hex) >= 130 and res_hex.startswith("0x"):
+                                            try:
+                                                hex_body = res_hex[2:]
+                                                answer = int(hex_body[64:128], 16)
+                                                if answer >= 2**255:
+                                                    answer -= 2**256
+                                                updated_at = int(hex_body[192:256], 16) * 1000
+                                                self.last_price = answer / (10 ** self.decimals)
+                                                self.last_updated_at = updated_at
+
+                                                if self.on_update:
+                                                    res = self.on_update({"price": self.last_price, "updatedAt": self.last_updated_at, "source": "chainlink_ws"})
+                                                    if asyncio.iscoroutine(res):
+                                                        asyncio.create_task(res)
+                                            except Exception:
+                                                pass
+
+                                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                                    break
+                        finally:
+                            sync_task.cancel()
             except Exception as e:
                 print(f"WS Error (Chainlink RPC): {e}")
                 if not self.closed:

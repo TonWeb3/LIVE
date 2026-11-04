@@ -70,13 +70,85 @@ def _sync_active_trades_to_latest_data():
         ts["balance"] = live_bal
         ts["has_live_creds"] = bool(settings.PRIVATE_KEY)
 
+_last_spot_broadcast_ts = 0.0
+
 def _wake_entry(data_payload=None):
+    global _last_spot_broadcast_ts
     _market_event.set()
+    if data_payload and isinstance(data_payload, dict):
+        p = data_payload.get("price")
+        if p and p > 0:
+            state["last_spot_price"] = p
+            prices = state.setdefault("latest_data", {}).setdefault("prices", {})
+            prices["spot"] = p
+            now = time.time()
+            if now - _last_spot_broadcast_ts >= 0.08 and _ws_clients:
+                _last_spot_broadcast_ts = now
+                asyncio.create_task(broadcast_state())
+
+def _on_chainlink_tick(data_payload=None):
+    if data_payload and isinstance(data_payload, dict):
+        p = data_payload.get("price")
+        if p and p > 0:
+            state["last_chainlink_price"] = p
+            prices = state.setdefault("latest_data", {}).setdefault("prices", {})
+            prices["chainlink"] = p
+            prices["chainlink_source"] = data_payload.get("source", "Chainlink RPC WS")
+            _market_event.set()
+            asyncio.create_task(broadcast_state())
 
 
 # ── Global state ───────────────────────────────────────────────────────────────
 state = {
-    "latest_data": {},
+        "latest_data": {
+        "timestamp": datetime.now().isoformat(),
+        "timing": {},
+        "market": None,
+        "trading_state": {
+            "mode": "hybrid",
+            "running": False,
+            "balance": 1000.0,
+            "equity": 1000.0,
+            "open_value": 0.0,
+            "active_trades": [],
+            "history_count": 0,
+            "risk": {"type": settings.RISK_TYPE, "value": settings.RISK_VALUE},
+            "symbol": settings.SYMBOL,
+            "has_live_creds": bool(settings.PRIVATE_KEY),
+            "withdraw_state": "idle",
+            "last_withdrawal": None,
+            "withdraw": {
+                "enabled": settings.AUTO_WITHDRAW_ENABLED,
+                "state": "ARMED",
+                "amount": settings.WITHDRAW_AMOUNT,
+                "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE
+            }
+        },
+        "prices": {
+            "spot": None,
+            "chainlink": None,
+            "chainlink_source": "Connecting...",
+            "poly_up": None,
+            "poly_down": None,
+            "window_open": None,
+            "window_open_source": None,
+            "model_open": None,
+            "window_start_ms": None,
+            "price_is_fresh": True,
+            "book_source": None
+        },
+        "indicators": {
+            "rsi": None,
+            "heiken": {"color": None, "count": 0},
+            "heiken_5m": {"color": None, "count": 0},
+            "fair": None
+        },
+        "analysis": {
+            "probability": {"adjustedUp": 0.5, "adjustedDown": 0.5},
+            "edge": {"edgeUp": None, "edgeDown": None},
+            "decision": {"action": "NO_TRADE", "reason": "initializing"}
+        }
+    },
     "last_update_ts": 0,
     "trading_mode": "hybrid",
     "paper_balance": 1000.0,
@@ -368,7 +440,7 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
 )
 polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
-chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
+chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL), on_update=_on_chainlink_tick)
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -1641,7 +1713,12 @@ async def live_balance_updater():
             pass
         await asyncio.sleep(2.5)
 
+_seeding_klines = False
 async def seed_kline_buffers():
+    global _seeding_klines
+    if globals().get("_seeding_klines"):
+        return
+    _seeding_klines = True
     try:
         k1m, k5m = await asyncio.gather(
             data.fetch_klines(settings.SYMBOL, "1m", 240),
@@ -1649,11 +1726,28 @@ async def seed_kline_buffers():
         )
         if k1m:
             binance_kline_1m.set_candles(k1m)
+            if not state.get("last_spot_price"):
+                last_c = k1m[-1]["close"]
+                state["last_spot_price"] = last_c
+                prices = state.setdefault("latest_data", {}).setdefault("prices", {})
+                prices["spot"] = last_c
+            if len(k1m) >= 15:
+                closes = [c["close"] for c in k1m if c.get("close")]
+                state["last_rsi"] = indicators.compute_rsi(closes, settings.RSI_PERIOD)
+                state.setdefault("latest_data", {}).setdefault("indicators", {})["rsi"] = state["last_rsi"]
+            if len(k1m) >= 2:
+                state["last_ha_1m"] = indicators.count_consecutive(indicators.compute_heiken_ashi(k1m))
+                state.setdefault("latest_data", {}).setdefault("indicators", {})["heiken"] = state["last_ha_1m"]
         if k5m:
             binance_kline_5m.set_candles(k5m)
+            if len(k5m) >= 2:
+                state["last_ha_5m"] = indicators.count_consecutive(indicators.compute_heiken_ashi(k5m))
+                state.setdefault("latest_data", {}).setdefault("indicators", {})["heiken_5m"] = state["last_ha_5m"]
         log_message(f"Seeded Binance kline buffers (1m: {len(k1m) if k1m else 0}, 5m: {len(k5m) if k5m else 0}) for {settings.SYMBOL}")
     except Exception as e:
         log_message(f"Failed to seed kline buffers: {e}")
+    finally:
+        _seeding_klines = False
 
 # ── Main update loop ──────────────────────────────────────────────────────────
 async def update_loop():
@@ -1675,8 +1769,10 @@ async def update_loop():
             poly_ws = polymarket_ws_stream.get_last()
             cl_ws = chainlink_ws_stream.get_last()
 
+            spot_cand = binance_ws.get("price") if binance_ws and binance_ws.get("price") else state.get("last_spot_price")
+            need_rest_spot = spot_cand is None
             results = await asyncio.gather(
-                data.fetch_last_price(settings.SYMBOL),
+                data.fetch_last_price(settings.SYMBOL) if need_rest_spot else asyncio.sleep(0, result=None),
                 chainlink.chainlink_fetcher.fetch_chainlink_btc_usd(),
                 fetch_polymarket_snapshot(),
                 return_exceptions=True
@@ -1718,6 +1814,9 @@ async def update_loop():
                         price_is_fresh = False
             elif cl_ws.get("price"):
                 current_price = cl_ws["price"]
+                price_source = "Chainlink RPC WS"
+            elif state.get("last_chainlink_price"):
+                current_price = state["last_chainlink_price"]
                 price_source = "Chainlink RPC WS"
             elif chainlink_data.get("price"):
                 current_price = chainlink_data["price"]
@@ -1779,13 +1878,22 @@ async def update_loop():
             else:
                 time_left_min = max(0.0, timing["remainingMinutes"])
 
-            closes = [c["close"] for c in klines_1m]
-            rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
+            closes = [c["close"] for c in klines_1m if c.get("close")]
+            rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD) if len(closes) >= 15 else state.get("last_rsi")
+            if rsi_now is not None:
+                state["last_rsi"] = rsi_now
 
-            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m))
+            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m)) if len(klines_1m) >= 2 else (state.get("last_ha_1m") or {"color": None, "count": 0})
+            if consec.get("color"):
+                state["last_ha_1m"] = consec
+
             consec_5m = {"color": None, "count": 0}
-            if len(klines_5m) >= 20:
+            if len(klines_5m) >= 2:
                 consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
+                if consec_5m.get("color"):
+                    state["last_ha_5m"] = consec_5m
+            elif state.get("last_ha_5m"):
+                consec_5m = state["last_ha_5m"]
 
             market_up = poly_snapshot.get("prices", {}).get("up") if poly_snapshot.get("ok") else None
             market_down = poly_snapshot.get("prices", {}).get("down") if poly_snapshot.get("ok") else None
@@ -2002,7 +2110,10 @@ async def lifespan(app: FastAPI):
         if cached_p:
             state["last_spot_price"] = cached_p
 
-    # Start all background tasks immediately so WebSockets stream without blocking
+    # Pre-seed full historical kline buffers so indicators are ready on very first render
+    await seed_kline_buffers()
+
+    # Start all background tasks
     tasks = [
         asyncio.create_task(binance_stream.start()),
         asyncio.create_task(binance_kline_1m.start()),
@@ -2016,8 +2127,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(entry_watcher())
     ]
 
-    # Concurrently seed kline buffers in background
-    asyncio.create_task(seed_kline_buffers())
+
 
     # Pre-warm CLOB trader client & on-chain verification in background thread if private key set
     if settings.PRIVATE_KEY:
@@ -2470,7 +2580,7 @@ async def post_settings(new_settings: Dict[str, Any]):
         asyncio.create_task(polymarket_ws_stream.start())
 
         chainlink_ws_stream.close()
-        chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
+        chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL), on_update=_on_chainlink_tick)
         asyncio.create_task(chainlink_ws_stream.start())
 
     await broadcast_state()
