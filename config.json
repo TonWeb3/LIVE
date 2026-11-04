@@ -7,7 +7,9 @@
   "live": {
     "max_slippage": 0.05,
     "exit_max_retries": 5,
-    "allow_partial_fill": true
+    "allow_partial_fill": true,
+    "relayer_api_key": "",
+    "alchemy_api_key": ""
   },
   "relayer": {
     "api_key": ""
@@ -18,11 +20,14 @@
     "withdraw_amount": 75000,
     "recipient_address": "",
     "auto_resume": true,
-    "resume_after": "flat"
+    "resume_after": "flat",
+    "withdraw_address": "",
+    "auto_resume_after_withdrawal": true,
+    "default_destination": ""
   },
   "telegram": {
     "enabled": false,
-    "bot_token": "8394214124:AAGQs5vsfU3EustebtWTwtVk4ZgDcCeR-to"
+    "bot_token": "839421...R-to"
   },
   "polymarket": {
     "gamma_base_url": "https://gamma-api.polymarket.com",
@@ -46,7 +51,7 @@
     "ev_threshold": 0.04,
     "min_prob": 0.55,
     "min_book_liquidity_usd": 20,
-    "max_book_age_s": 3.0
+    "max_book_age_s": 3
   },
   "settlement": {
     "authoritative_settle_wait_s": 90
@@ -54,7 +59,7 @@
   "flip": {
     "enabled": false,
     "min_conviction": 0.8,
-    "min_minutes_left": 9.0
+    "min_minutes_left": 9
   },
   "chainlink": {
     "polygon_rpc_url": "https://polygon.drpc.org",

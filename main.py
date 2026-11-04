@@ -792,16 +792,21 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 live_amount = max(1.0, min(live_amount, live_balance)) if live_balance >= 1.0 else 0.0
                 state["precomputed_live_stake"] = round(live_amount, 2)
 
-            if cur_ask_liq_usd is not None and cur_ask_liq_usd > 0 and live_amount > 0:
-                live_amount = max(1.0, round(min(live_amount, cur_ask_liq_usd), 2)) if live_balance >= 1.0 else 0.0
-
-            if live_balance < 1.0 or live_amount < 1.0:
+            # Polymarket order size minimum: at least 5 shares and at least $1.00
+            min_order_cost = round(max(1.00, math.ceil(5.0 * current_ask * 100.0) / 100.0), 2)
+            if live_balance < min_order_cost:
                 trade["live_status"] = "INSUFFICIENT_FUNDS"
-                log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < $1.00 minimum)")
+                log_message(f"LIVE copy halted for {trade['market_slug']}: deposit balance too low (${live_balance:.2f} < ${min_order_cost:.2f} minimum for 5 shares @ {current_ask:.4f})")
                 await asyncio.to_thread(save_state)
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
                 break
+
+            if live_amount < min_order_cost:
+                live_amount = min_order_cost
+
+            if cur_ask_liq_usd is not None and cur_ask_liq_usd >= min_order_cost and live_amount > cur_ask_liq_usd:
+                live_amount = round(cur_ask_liq_usd, 2)
 
             # 4. Place GTD limit BUY order directly with progressive sweep
             extra_slip = min(0.08, (attempt_num - 1) * 0.015)
