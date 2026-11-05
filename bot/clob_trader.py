@@ -18,8 +18,8 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 """
 
 import threading
-from datetime import datetime
 import time
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
 
@@ -242,9 +242,6 @@ class ClobTrader:
         self._approvals_done = False
         self._api_creds = None
         self._rust_ready = False
-        self._cached_balance = None
-        self._last_balance_ts = 0.0
-        self._balance_fetching = False
         self._lock = threading.Lock()
 
     def reset(self):
@@ -260,9 +257,6 @@ class ClobTrader:
             self._approvals_done = False
             self._api_creds = None
             self._rust_ready = False
-            self._cached_balance = None
-            self._last_balance_ts = 0.0
-            self._balance_fetching = False
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
         """CLOB API creds derived from the key (L1 auth). Cached. Doubles as the
@@ -335,7 +329,8 @@ class ClobTrader:
 
     def _candidate_wallets(self, gasless) -> List[Tuple[int, str, str]]:
         """(signature_type, address, label) candidates derived from the EOA:
-        1. Explicit user override if configured
+        0. Explicit user override if configured
+        1. Polymarket Official Profile Wallet (automatic via Gamma public profile)
         2. Modern Beacon Deposit Wallet (V2, st=3, post-June 29 standard)
         3. Legacy UUPS Deposit Wallet (st=3, pre-June 29)
         4. Legacy Proxy Wallet (st=1)
@@ -344,27 +339,13 @@ class ClobTrader:
         Never includes unverified counterparty maker addresses from market trades."""
         out: List[Tuple[int, str, str]] = []
 
-        # 0. Recent trade history discovery directly from Polymarket CLOB
+        # Derive EOA address
+        eoa_addr = None
         try:
-            creds = self._derive_creds()
-            from polymarket_apis.clients.clob_client import PolymarketClobClient
-            from web3 import Web3
-            eoa_probe = None
-            try:
-                from eth_account import Account
-                eoa_probe = Account.from_key(settings.PRIVATE_KEY).address
-            except Exception:
-                pass
-            client_probe = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa_probe or "0x0000000000000000000000000000000000000000", chain_id=137)
-            client_probe.set_api_creds(creds)
-            recent_trades = client_probe.get_trades()
-            if recent_trades and len(recent_trades) > 0:
-                trade_maker = getattr(recent_trades[0], "maker_address", None)
-                if trade_maker and trade_maker.startswith("0x") and len(trade_maker) == 42:
-                    chk_maker = Web3.to_checksum_address(trade_maker)
-                    out.append((3, chk_maker, "Polymarket Trade History Deposit Wallet"))
+            from eth_account import Account
+            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
         except Exception:
-            pass
+            eoa_addr = None
 
         # Explicit user override
         explicit_funder = getattr(settings, "FUNDER_ADDRESS", "").strip()
@@ -383,15 +364,31 @@ class ClobTrader:
             except Exception:
                 pass
 
-        # Derive EOA address
-        eoa_addr = None
-        try:
-            from eth_account import Account
-            eoa_addr = Account.from_key(settings.PRIVATE_KEY).address
-        except Exception:
-            eoa_addr = None
+        # 1. Polymarket Official Gamma Profile Discovery (Works for all accounts: Email/Magic, Metamask, Turnkey, etc.)
+        if eoa_addr:
+            try:
+                import urllib.request
+                import json
+                from web3 import Web3
+                gamma_url = f"{settings.GAMMA_BASE_URL.rstrip('/')}/public-profile?address={eoa_addr}"
+                req = urllib.request.Request(gamma_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        profile_proxy = data.get("proxyWallet")
+                        if profile_proxy and profile_proxy.startswith("0x") and len(profile_proxy) == 42:
+                            chk_profile = Web3.to_checksum_address(profile_proxy)
+                            detected_st = None
+                            try:
+                                detected_st = gasless.detect_wallet_signature_type(chk_profile)
+                            except Exception:
+                                detected_st = None
+                            st_to_use = detected_st if detected_st in (0, 1, 2, 3) else 3
+                            out.append((st_to_use, chk_profile, "Polymarket Profile Wallet (Automatic)"))
+            except Exception:
+                pass
 
-        # 1. Modern Beacon Proxy Deposit Wallet (st=3, June 29, 2026+ standard)
+        # 2. Modern Beacon Proxy Deposit Wallet (st=3, June 29, 2026+ standard)
         if eoa_addr:
             try:
                 beacon_wallet = derive_beacon_deposit_wallet(eoa_addr)
@@ -400,7 +397,7 @@ class ClobTrader:
             except Exception:
                 pass
 
-        # 2. Legacy UUPS Deposit Wallet (st=3, polymarket-apis 2.3.0 default)
+        # 3. Legacy UUPS Deposit Wallet (st=3, polymarket-apis 2.3.0 default)
         try:
             legacy_dep = gasless.get_expected_deposit_wallet()
             if legacy_dep and not any(a.lower() == legacy_dep.lower() for _, a, _ in out):
@@ -408,7 +405,7 @@ class ClobTrader:
         except Exception:
             pass
 
-        # 3. Polymarket Proxy Wallet (st=1)
+        # 4. Polymarket Proxy Wallet (st=1)
         try:
             poly_proxy = gasless.get_poly_proxy_wallet_address()
             if poly_proxy and not any(a.lower() == poly_proxy.lower() for _, a, _ in out):
@@ -416,7 +413,7 @@ class ClobTrader:
         except Exception:
             pass
 
-        # 4. Safe Proxy Wallet (st=2)
+        # 5. Safe Proxy Wallet (st=2)
         try:
             safe_proxy = gasless.get_safe_proxy_wallet_address()
             if safe_proxy and not any(a.lower() == safe_proxy.lower() for _, a, _ in out):
@@ -424,7 +421,7 @@ class ClobTrader:
         except Exception:
             pass
 
-        # 5. Direct EOA (st=0)
+        # 6. Direct EOA (st=0)
         if eoa_addr and not any(a.lower() == eoa_addr.lower() for _, a, _ in out):
             out.append((0, eoa_addr, "Personal Signer (EOA)"))
 
@@ -515,21 +512,27 @@ class ClobTrader:
         except Exception:
             pass
 
-        # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender
-        rust_mod = _ensure_rust_clob()
-        pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
-        creds = clob.creds
-        rust_mod.init_client(
-            str(pk_hex),
-            str(funder),
-            int(sig_type),
-            str(creds.key),
-            str(creds.secret),
-            str(creds.passphrase),
-            str(clob.base_url),
-            137,
-        )
-        self._rust_ready = True
+        # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender (optional accelerator)
+        self._rust_ready = False
+        try:
+            rust_mod = _ensure_rust_clob()
+            if rust_mod:
+                pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
+                creds = clob.creds
+                rust_mod.init_client(
+                    str(pk_hex),
+                    str(funder),
+                    int(sig_type),
+                    str(creds.key),
+                    str(creds.secret),
+                    str(creds.passphrase),
+                    str(clob.base_url),
+                    137,
+                )
+                self._rust_ready = True
+        except Exception as e:
+            print(f"[clob_trader] Note: rust_clob native sender unavailable ({e}), using optimized Python/C signing.")
+            self._rust_ready = False
 
         self.gasless = gasless
         self.clob = clob
@@ -540,19 +543,22 @@ class ClobTrader:
 
     def is_ready(self) -> bool:
         """Check if CLOB client is initialized and ready without triggering blocking setup."""
-        return bool(self.ready and self.clob is not None and self._rust_ready)
+        return bool(self.ready and self.clob is not None)
 
     def ensure_ready(self) -> bool:
-        if self.ready and self.clob is not None and self._rust_ready:
+        if self.ready and self.clob is not None:
             return True
         with self._lock:
-            if self.ready and self.clob is not None and self._rust_ready:
+            if self.ready and self.clob is not None:
                 return True
             if not settings.PRIVATE_KEY:
                 self.last_error = "missing_private_key"
                 return False
             try:
                 self._init_clients()
+                # Pre-warm native Rust crypto signing context
+                rust_mod = _ensure_rust_clob()
+                _ = rust_mod.build_signed_order("1", 1000000, 1000000, 0, "FAK", "0", False, False, False)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -665,18 +671,39 @@ class ClobTrader:
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
-            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
-                "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
-            )
-            data = self._post_order_fast(
-                token_id=str(token_id),
-                maker_amount=maker_amt,
-                taker_amount=taker_amt,
-                side_int=side_int,
-                order_type_str="GTD",
-                expiration_str=str(exp),
-                neg_risk=False,
-            )
+            data = None
+            if getattr(self, "_rust_ready", False):
+                try:
+                    side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                        "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
+                    )
+                    data = self._post_order_fast(
+                        token_id=str(token_id),
+                        maker_amount=maker_amt,
+                        taker_amount=taker_amt,
+                        side_int=side_int,
+                        order_type_str="GTD",
+                        expiration_str=str(exp),
+                        neg_risk=False,
+                    )
+                except Exception as rust_err:
+                    print(f"[clob_trader] Warning: Rust fast sender ({rust_err}), falling back to Python SDK...")
+                    data = None
+
+            if not data:
+                from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+                args = OrderArgs(
+                    token_id=str(token_id),
+                    price=order_price,
+                    size=order_size,
+                    side="BUY",
+                    expiration=exp
+                )
+                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
+                if resp is None:
+                    return {"ok": False, "error": "no_response_from_clob"}
+                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
@@ -708,18 +735,39 @@ class ClobTrader:
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
-            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
-                "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
-            )
-            data = self._post_order_fast(
-                token_id=str(token_id),
-                maker_amount=maker_amt,
-                taker_amount=taker_amt,
-                side_int=side_int,
-                order_type_str="GTD",
-                expiration_str=str(exp),
-                neg_risk=False,
-            )
+            data = None
+            if getattr(self, "_rust_ready", False):
+                try:
+                    side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                        "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
+                    )
+                    data = self._post_order_fast(
+                        token_id=str(token_id),
+                        maker_amount=maker_amt,
+                        taker_amount=taker_amt,
+                        side_int=side_int,
+                        order_type_str="GTD",
+                        expiration_str=str(exp),
+                        neg_risk=False,
+                    )
+                except Exception as rust_err:
+                    print(f"[clob_trader] Warning: Rust fast sender ({rust_err}), falling back to Python SDK...")
+                    data = None
+
+            if not data:
+                from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+                args = OrderArgs(
+                    token_id=str(token_id),
+                    price=order_price,
+                    size=order_size,
+                    side="SELL",
+                    expiration=exp
+                )
+                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+                resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
+                if resp is None:
+                    return {"ok": False, "error": "no_response_from_clob"}
+                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
@@ -1219,5 +1267,6 @@ class ClobTrader:
             return getattr(self, "_cached_balance", None)
         finally:
             self._balance_fetching = False
+
 
 clob_trader = ClobTrader()

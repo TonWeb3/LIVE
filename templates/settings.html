@@ -90,16 +90,6 @@
                         <input type="number" step="any" min="0" max="0.50" x-model.number="form.live.max_slippage" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
                         <p class="text-[10px] text-gray-500 mt-2 italic">Live orders limit price = best_ask + slippage. Prevents bad fills.</p>
                     </div>
-                    <div>
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Max Copy Retries</label>
-                        <input type="number" step="1" min="1" max="50" x-model.number="form.copy_trader.max_retries" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Continuous order attempts before stopping (default: 5).</p>
-                    </div>
-                    <div>
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Retry Interval (ms)</label>
-                        <input type="number" step="50" min="50" max="5000" x-model.number="form.copy_trader.retry_interval_ms" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Delay between retry attempts in milliseconds (default: 300ms).</p>
-                    </div>
                 </div>
             </div>
 
@@ -601,7 +591,6 @@
                 form: {
                     has_live_creds: false,
                     private_key: '',
-                    copy_trader: { retry_interval_ms: 300, max_retries: 5 },
                     polymarket: { series_id: '' },
                     trading: { symbol: '', risk_type: 'percent', risk_value: 10 },
                     ev: { ev_threshold: 0.04, min_prob: 0.55, min_book_liquidity_usd: 20.0 },

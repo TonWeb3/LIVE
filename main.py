@@ -738,7 +738,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
         return
 
     log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous GTD fill loop initiated")
-    retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
+    retry_interval = max(0.01, float(getattr(settings, "COPY_RETRY_INTERVAL_MS", 300) or 300) / 1000.0)
     max_attempts = int(getattr(settings, "COPY_MAX_RETRIES", 5) or 5)
 
     try:
@@ -2544,10 +2544,6 @@ async def get_settings():
     return {
         "has_live_creds": bool(settings.PRIVATE_KEY),
         "private_key": masked_pk,
-        "copy_trader": {
-            "retry_interval_ms": settings.COPY_RETRY_INTERVAL_MS,
-            "max_retries": settings.COPY_MAX_RETRIES
-        },
         "live": {
             "relayer_api_key": mask(settings.RELAYER_API_KEY),
             "alchemy_api_key": mask(settings.ALCHEMY_API_KEY),
@@ -2671,8 +2667,8 @@ async def post_settings(new_settings: Dict[str, Any]):
     with open(CONFIG_PATH, "w") as f:
         json.dump(merged_cfg, f, indent=2)
 
-    if "copy_trader" in new_settings:
-        ct = new_settings["copy_trader"]
+    ct = merged_cfg.get("copy_trader", {})
+    if ct:
         if "retry_interval_ms" in ct: settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
         if "max_retries" in ct: settings.COPY_MAX_RETRIES = int(ct["max_retries"])
 
