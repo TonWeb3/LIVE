@@ -1,4 +1,4 @@
-# Polymarket BTC 15m Assistant [GTD] (Python FastAPI)
+# Polymarket BTC 15m Assistant (Python FastAPI)
 
 A real-time trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** markets, ported to Python and FastAPI.
 
@@ -55,18 +55,18 @@ All of these are also editable live on the **Settings** page.
 ### 3) Run
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8050
+uvicorn main:app --host 0.0.0.0 --port 8082
 # or simply:
 python main.py
 ```
 
-Access the dashboard at `http://localhost:8050`.
+Access the dashboard at `http://localhost:8082`.
 
 ## Docker
 
 ```bash
-docker build -t polymarket-assistant-gtd .
-docker run -p 8050:8050 polymarket-assistant-gtd
+docker build -t polymarket-assistant-gtc .
+docker run -p 8082:8082 polymarket-assistant-gtc
 ```
 
 ## Deployment on Render
@@ -81,12 +81,12 @@ The repository includes a `render.yaml`. When creating a new blueprint on Render
 2. Under **Runtime**, explicitly select **Python 3**.
 3. Set the following commands:
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8050`
+   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port 8082`
 4. Add any necessary environment variables (optional).
 
 ## Live Trading
 
-Switching **Mode** to `live` makes the bot place real **Good 'Til Date (GTD) limit BUY**
+Switching **Mode** to `live` makes the bot place real **Good 'Til Cancelled (GTC) limit BUY**
 orders on **Polymarket CLOB V2** via `polymarket-apis`, using the gasless
 **deposit-wallet** flow.
 

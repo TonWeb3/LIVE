@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Dashboard [GTD] - Polymarket Assistant</title>
+    <title>Dashboard [GTC] - Polymarket Assistant</title>
         <script>
         // Suppress Tailwind Play CDN warning in developer console
         const _origWarn = console.warn;
@@ -29,7 +29,7 @@
         <header class="flex flex-col sm:flex-row justify-between items-center mb-6 sm:mb-8 gap-4">
             <div class="flex items-center gap-2 sm:gap-3">
                 <h1 class="text-2xl sm:text-3xl font-bold text-blue-400" x-text="(data.trading_state?.symbol || 'BTC') + ' 15m Assistant'"></h1>
-                <span class="bg-indigo-900/80 text-indigo-300 border border-indigo-500/50 px-2 sm:px-2.5 py-0.5 rounded font-mono text-xs font-black tracking-wider" title="Strictly Good 'Til Date (GTD) execution mode">GTD</span>
+                <span class="bg-indigo-900/80 text-indigo-300 border border-indigo-500/50 px-2 sm:px-2.5 py-0.5 rounded font-mono text-xs font-black tracking-wider" title="Strictly Good 'Til Cancelled (GTC) execution mode">GTC</span>
             </div>
             <div class="flex space-x-2 sm:space-x-4 items-center">
                 <div class="flex items-center space-x-2 text-[10px] sm:text-xs mr-2 sm:mr-4">
@@ -242,10 +242,10 @@
                                         <td class="px-4 py-3 font-mono text-gray-300" x-text="trade.paper_entry_price != null ? ((trade.paper_entry_price * 100).toFixed(0) + '¢') : ((trade.entry_price * 100).toFixed(0) + '¢')"></td>
                                         <td class="px-4 py-3 font-mono font-bold">
                                             <span x-show="trade.live_status === 'FILLED'" class="text-emerald-400" x-text="trade.live_entry_price != null ? ((trade.live_entry_price * 100).toFixed(0) + '¢') : '—'"></span>
-                                            <span x-show="trade.live_status === 'GTD_OPEN'" class="text-amber-400 animate-pulse text-xs" x-text="trade.live_limit_price != null ? ((trade.live_limit_price * 100).toFixed(0) + '¢ (GTD)') : 'GTD'"></span>
+                                            <span x-show="trade.live_status === 'GTC_OPEN'" class="text-amber-400 animate-pulse text-xs" x-text="trade.live_limit_price != null ? ((trade.live_limit_price * 100).toFixed(0) + '¢ (GTC)') : 'GTC'"></span>
                                             <span x-show="trade.live_status === 'FILLING'" class="text-amber-400 animate-pulse text-xs" x-text="'Filling (#' + (trade.live_attempts || 1) + ')…'"></span>
                                             <span x-show="trade.live_status === 'NO_CREDS'" class="text-gray-500 text-xs">No Key</span>
-                                            <span x-show="trade.live_status !== 'FILLED' && trade.live_status !== 'GTD_OPEN' && trade.live_status !== 'FILLING' && trade.live_status !== 'NO_CREDS'" class="text-gray-500 text-xs" x-text="trade.live_status || '—'"></span>
+                                            <span x-show="trade.live_status !== 'FILLED' && trade.live_status !== 'GTC_OPEN' && trade.live_status !== 'FILLING' && trade.live_status !== 'NO_CREDS'" class="text-gray-500 text-xs" x-text="trade.live_status || '—'"></span>
                                         </td>
                                         <td class="px-4 py-3 font-mono" x-text="(trade.live_status === 'FILLED') ? formatShares(trade.live_shares) : '—'"></td>
                                         <td class="px-4 py-3 font-mono font-bold"
@@ -258,13 +258,13 @@
                                             </div>
                                             <div class="flex items-center gap-1.5">
                                                 <span class="text-gray-500 font-bold uppercase text-[9px]">Live:</span>
-                                                <span :class="trade.live_status === 'FILLED' ? 'text-emerald-400 font-mono' : ((trade.live_status === 'FILLING' || trade.live_status === 'GTD_OPEN') ? 'text-amber-400 font-mono animate-pulse' : 'text-gray-500')"
-                                                      x-text="trade.live_status === 'FILLED' ? formatTimeOnly(trade.live_entry_time) : (trade.live_status === 'GTD_OPEN' ? 'GTD Resting' : (trade.live_status === 'FILLING' ? 'Retrying…' : (trade.live_status === 'NO_CREDS' ? 'No Key' : trade.live_status)))"></span>
+                                                <span :class="trade.live_status === 'FILLED' ? 'text-emerald-400 font-mono' : ((trade.live_status === 'FILLING' || trade.live_status === 'GTC_OPEN') ? 'text-amber-400 font-mono animate-pulse' : 'text-gray-500')"
+                                                      x-text="trade.live_status === 'FILLED' ? formatTimeOnly(trade.live_entry_time) : (trade.live_status === 'GTC_OPEN' ? 'GTC Resting' : (trade.live_status === 'FILLING' ? 'Retrying…' : (trade.live_status === 'NO_CREDS' ? 'No Key' : trade.live_status)))"></span>
                                             </div>
                                         </td>
                                         <td class="px-4 py-3 text-right font-bold"
-                                            :class="trade.awaiting_resolution ? 'text-sky-400' : (trade.live_status === 'GTD_OPEN' ? 'text-amber-400' : 'text-yellow-500')"
-                                            x-text="trade.awaiting_resolution ? 'RESOLVING' : (trade.live_status === 'GTD_OPEN' ? 'GTD OPEN' : trade.status)"></td>
+                                            :class="trade.awaiting_resolution ? 'text-sky-400' : (trade.live_status === 'GTC_OPEN' ? 'text-amber-400' : 'text-yellow-500')"
+                                            x-text="trade.awaiting_resolution ? 'RESOLVING' : (trade.live_status === 'GTC_OPEN' ? 'GTC OPEN' : trade.status)"></td>
                                     </tr>
                                 </template>
                                 <tr x-show="!data.trading_state?.active_trades?.length">
@@ -483,10 +483,10 @@
                         this.lastLogSeq = seq;
                         if (this.tab === 'logs') this.refreshLogs();
                     }
-                    if (this.tab === 'history' && (!this._lastHistorySeq || this._lastHistorySeq !== seq)) {
-                    this._lastHistorySeq = seq;
-                    this.loadHistory();
-                }
+                    if (this.tab === 'history' && (!this._lastHistorySeq || this._lastHistorySeq !== data.log_seq)) {
+                this._lastHistorySeq = data.log_seq;
+                this.loadHistory();
+            }
                 },
                 async loadHistory() {
                     try { this.tradeHistory = (await (await fetch('/history')).json()).reverse(); }

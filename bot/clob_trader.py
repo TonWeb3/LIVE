@@ -18,8 +18,8 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 """
 
 import threading
-from datetime import datetime
 import time
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
 
@@ -242,9 +242,6 @@ class ClobTrader:
         self._approvals_done = False
         self._api_creds = None
         self._rust_ready = False
-        self._cached_balance = None
-        self._last_balance_ts = 0.0
-        self._balance_fetching = False
         self._lock = threading.Lock()
 
     def reset(self):
@@ -260,9 +257,6 @@ class ClobTrader:
             self._approvals_done = False
             self._api_creds = None
             self._rust_ready = False
-            self._cached_balance = None
-            self._last_balance_ts = 0.0
-            self._balance_fetching = False
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
         """CLOB API creds derived from the key (L1 auth). Cached. Doubles as the
@@ -531,6 +525,9 @@ class ClobTrader:
                 return False
             try:
                 self._init_clients()
+                # Pre-warm native Rust crypto signing context
+                rust_mod = _ensure_rust_clob()
+                _ = rust_mod.build_signed_order("1", 1000000, 1000000, 0, "FAK", "0", False, False, False)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -616,6 +613,7 @@ class ClobTrader:
                 pass
             if http_status == 0:
                 raise RuntimeError(res.get("transport_error") or "rust_clob transport error")
+            err_detail = self.enrich_order_error(err_detail)
             raise RuntimeError(f"OrderPlacementError: Order placement failed: HTTP {http_status} - {err_detail}")
         data = json.loads(resp_text) if resp_text else {}
         if isinstance(data, dict):
@@ -623,10 +621,9 @@ class ClobTrader:
             data["rust_total_us"] = res.get("total_time_us")
         return data
 
-    def place_limit_buy(self, token_id: str, size: float, price: float, expiration: Optional[int] = None) -> Dict[str, Any]:
-        """Place a Good 'Til Date (GTD) limit BUY order for `size` shares at `price`.
-        Sweeps asks up to `price` and rests any remaining unfilled size on the book
-        until filled, cancelled, or the expiration timestamp is reached."""
+    def place_limit_buy(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
+        """Place a Good 'Til Cancelled (GTC) limit BUY order for `size` shares at `price`.
+        Sweeps asks up to `price` and rests any remaining unfilled size on the book."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
@@ -640,7 +637,6 @@ class ClobTrader:
             from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
-            exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
             side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
                 "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
@@ -650,8 +646,8 @@ class ClobTrader:
                 maker_amount=maker_amt,
                 taker_amount=taker_amt,
                 side_int=side_int,
-                order_type_str="GTD",
-                expiration_str=str(exp),
+                order_type_str="GTC",
+                expiration_str="0",
                 neg_risk=False,
             )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
@@ -662,14 +658,13 @@ class ClobTrader:
                 "status": status or "open",
                 "price": order_price,
                 "size": order_size,
-                "expiration": exp,
                 "response": data
             }
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    def place_limit_sell(self, token_id: str, size: float, price: float, expiration: Optional[int] = None) -> Dict[str, Any]:
-        """Place a Good 'Til Date (GTD) limit SELL order for `size` shares at `price`."""
+    def place_limit_sell(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
+        """Place a Good 'Til Cancelled (GTC) limit SELL order for `size` shares at `price`."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
@@ -683,7 +678,6 @@ class ClobTrader:
             from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
-            exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
             side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
                 "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
@@ -693,8 +687,8 @@ class ClobTrader:
                 maker_amount=maker_amt,
                 taker_amount=taker_amt,
                 side_int=side_int,
-                order_type_str="GTD",
-                expiration_str=str(exp),
+                order_type_str="GTC",
+                expiration_str="0",
                 neg_risk=False,
             )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
@@ -705,7 +699,6 @@ class ClobTrader:
                 "status": status or "open",
                 "price": order_price,
                 "size": order_size,
-                "expiration": exp,
                 "response": data
             }
         except Exception as e:
@@ -1023,6 +1016,58 @@ class ClobTrader:
             return False
 
     # ── diagnostics / balance ───────────────────────────────────────────────────
+    def get_api_key(self) -> Optional[str]:
+        """Return the active L2 CLOB API key string if available."""
+        if self.clob and hasattr(self.clob, "creds") and getattr(self.clob.creds, "key", None):
+            return str(self.clob.creds.key).strip()
+        if self._api_creds and getattr(self._api_creds, "key", None):
+            return str(self._api_creds.key).strip()
+        return None
+
+    def enrich_order_error(self, err: Any) -> str:
+        """Enrich Polymarket error messages with specific signer address and API key prefix."""
+        if not err:
+            return ""
+        err_str = str(err)
+        import re
+        if "the order signer address has to be the address of the API KEY" in err_str or (
+            "order signer address" in err_str.lower() and "address of the api key" in err_str.lower()
+        ):
+            signer_addr = self.get_eoa_address()
+            if not signer_addr and self.clob and hasattr(self.clob, "signer"):
+                signer_addr = getattr(self.clob.signer, "address", "") or getattr(getattr(self.clob.signer, "account", None), "address", "")
+            if not signer_addr and settings.PRIVATE_KEY:
+                try:
+                    from eth_account import Account
+                    signer_addr = Account.from_key(settings.PRIVATE_KEY).address
+                except Exception:
+                    pass
+            signer_addr = signer_addr or "unknown"
+
+            api_key_str = self.get_api_key() or ""
+            api_prefix = api_key_str[:7] if api_key_str else "unknown"
+
+            if f"the order signer address {signer_addr} has to be the address of the API KEY {api_prefix}" in err_str:
+                return err_str
+
+            pattern = re.compile(
+                r"the order signer address\s*(?:\{put the address\}|0x[0-9a-fA-F]{40})?\s*has to be the address of the API KEY(?:\s*\{put in the first 7 characters of the API\}|\s*[a-zA-Z0-9_\-]+)?",
+                re.IGNORECASE
+            )
+            if pattern.search(err_str):
+                return pattern.sub(
+                    f"the order signer address {signer_addr} has to be the address of the API KEY {api_prefix}",
+                    err_str
+                )
+            else:
+                return re.sub(
+                    r"the order signer address.*?address of the API KEY",
+                    f"the order signer address {signer_addr} has to be the address of the API KEY {api_prefix}",
+                    err_str,
+                    flags=re.IGNORECASE
+                )
+        return err_str
+
     def get_eoa_address(self) -> Optional[str]:
         """The EOA address derived from PRIVATE_KEY — the wallet you control (the
         key/seed owner). It signs orders but holds no funds or gas."""
@@ -1144,5 +1189,6 @@ class ClobTrader:
             return getattr(self, "_cached_balance", None)
         finally:
             self._balance_fetching = False
+
 
 clob_trader = ClobTrader()

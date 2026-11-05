@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     PAPER_BALANCE_USD: float = 1000.0
     PRIVATE_KEY: str = ""
 
-    # ── Copy-trader continuous GTD execution ───────────────────────────────────
+    # ── Copy-trader continuous GTC execution ───────────────────────────────────
     COPY_RETRY_INTERVAL_MS: int = 300
     COPY_MAX_RETRIES: int = 5
 

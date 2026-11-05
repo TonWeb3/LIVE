@@ -19,10 +19,7 @@
     "withdraw_amount": 75000,
     "recipient_address": "",
     "auto_resume": true,
-    "resume_after": "flat",
-    "withdraw_address": "",
-    "auto_resume_after_withdrawal": true,
-    "default_destination": ""
+    "resume_after": "flat"
   },
   "telegram": {
     "enabled": false,
@@ -50,7 +47,7 @@
     "ev_threshold": 0.04,
     "min_prob": 0.55,
     "min_book_liquidity_usd": 20,
-    "max_book_age_s": 3
+    "max_book_age_s": 3.0
   },
   "settlement": {
     "authoritative_settle_wait_s": 90
@@ -58,7 +55,7 @@
   "flip": {
     "enabled": false,
     "min_conviction": 0.8,
-    "min_minutes_left": 9
+    "min_minutes_left": 9.0
   },
   "chainlink": {
     "polygon_rpc_url": "https://polygon.drpc.org",
