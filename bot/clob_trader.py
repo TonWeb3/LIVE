@@ -18,8 +18,8 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 """
 
 import threading
-import time
 from datetime import datetime
+import time
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
 
@@ -242,6 +242,9 @@ class ClobTrader:
         self._approvals_done = False
         self._api_creds = None
         self._rust_ready = False
+        self._cached_balance = None
+        self._last_balance_ts = 0.0
+        self._balance_fetching = False
         self._lock = threading.Lock()
 
     def reset(self):
@@ -257,6 +260,9 @@ class ClobTrader:
             self._approvals_done = False
             self._api_creds = None
             self._rust_ready = False
+            self._cached_balance = None
+            self._last_balance_ts = 0.0
+            self._balance_fetching = False
     # ── wallet derivation / detection ───────────────────────────────────────────
     def _derive_creds(self):
         """CLOB API creds derived from the key (L1 auth). Cached. Doubles as the
@@ -525,9 +531,6 @@ class ClobTrader:
                 return False
             try:
                 self._init_clients()
-                # Pre-warm native Rust crypto signing context
-                rust_mod = _ensure_rust_clob()
-                _ = rust_mod.build_signed_order("1", 1000000, 1000000, 0, "FAK", "0", False, False, False)
                 return True
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -621,9 +624,10 @@ class ClobTrader:
             data["rust_total_us"] = res.get("total_time_us")
         return data
 
-    def place_limit_buy(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
-        """Place a Good 'Til Cancelled (GTC) limit BUY order for `size` shares at `price`.
-        Sweeps asks up to `price` and rests any remaining unfilled size on the book."""
+    def place_limit_buy(self, token_id: str, size: float, price: float, expiration: Optional[int] = None) -> Dict[str, Any]:
+        """Place a Good 'Til Date (GTD) limit BUY order for `size` shares at `price`.
+        Sweeps asks up to `price` and rests any remaining unfilled size on the book
+        until filled, cancelled, or the expiration timestamp is reached."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
@@ -637,6 +641,7 @@ class ClobTrader:
             from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
+            exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
             side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
                 "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
@@ -646,8 +651,8 @@ class ClobTrader:
                 maker_amount=maker_amt,
                 taker_amount=taker_amt,
                 side_int=side_int,
-                order_type_str="GTC",
-                expiration_str="0",
+                order_type_str="GTD",
+                expiration_str=str(exp),
                 neg_risk=False,
             )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
@@ -658,13 +663,14 @@ class ClobTrader:
                 "status": status or "open",
                 "price": order_price,
                 "size": order_size,
+                "expiration": exp,
                 "response": data
             }
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    def place_limit_sell(self, token_id: str, size: float, price: float) -> Dict[str, Any]:
-        """Place a Good 'Til Cancelled (GTC) limit SELL order for `size` shares at `price`."""
+    def place_limit_sell(self, token_id: str, size: float, price: float, expiration: Optional[int] = None) -> Dict[str, Any]:
+        """Place a Good 'Til Date (GTD) limit SELL order for `size` shares at `price`."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
@@ -678,6 +684,7 @@ class ClobTrader:
             from polymarket_apis.utilities.order_builder.builder import ROUNDING_CONFIG
             order_price = round(float(price), 4)
             order_size = round(float(size), 2)
+            exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
             side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
                 "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
@@ -687,8 +694,8 @@ class ClobTrader:
                 maker_amount=maker_amt,
                 taker_amount=taker_amt,
                 side_int=side_int,
-                order_type_str="GTC",
-                expiration_str="0",
+                order_type_str="GTD",
+                expiration_str=str(exp),
                 neg_risk=False,
             )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
@@ -699,6 +706,7 @@ class ClobTrader:
                 "status": status or "open",
                 "price": order_price,
                 "size": order_size,
+                "expiration": exp,
                 "response": data
             }
         except Exception as e:
@@ -1189,6 +1197,5 @@ class ClobTrader:
             return getattr(self, "_cached_balance", None)
         finally:
             self._balance_fetching = False
-
 
 clob_trader = ClobTrader()

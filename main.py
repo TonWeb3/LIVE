@@ -525,7 +525,11 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         _cached_market = market
         _cached_market_ts = now
         _cached_market_series = curr_target
-    return market
+        return market
+
+    _cached_market = None
+    _cached_market_ts = 0.0
+    return None
 
 async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     market = await get_active_market()
@@ -733,7 +737,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
         _in_flight_markets.discard(cur_slug)
         return
 
-    log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous GTC fill loop initiated")
+    log_message(f"LIVE copy started for {trade['market_slug']} ({side}) — continuous GTD fill loop initiated")
     retry_interval = max(0.05, min(0.20, settings.COPY_RETRY_INTERVAL_MS / 1000.0))
     max_attempts = int(getattr(settings, "COPY_MAX_RETRIES", 5) or 5)
 
@@ -832,38 +836,42 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             if cur_ask_liq_usd is not None and cur_ask_liq_usd >= min_order_cost and live_amount > cur_ask_liq_usd:
                 live_amount = round(cur_ask_liq_usd, 2)
 
-            # 4. Place GTC limit BUY order directly with progressive sweep
+            # 4. Place GTD limit BUY order directly with progressive sweep
             extra_slip = min(0.08, (attempt_num - 1) * 0.015)
-            gtc_price = min(0.99, round(current_ask + settings.CLOB_MAX_SLIPPAGE + extra_slip, 4))
+            gtd_price = min(0.99, round(current_ask + settings.CLOB_MAX_SLIPPAGE + extra_slip, 4))
             safe_usd = max(1.00, live_amount)
             # Guarantee shares >= 5.0 and shares * price >= 1.00 (Polymarket min order size rule: min 5 shares)
             min_shares = 5.0
-            gtc_shares = max(min_shares, math.ceil((safe_usd / gtc_price) * 100.0) / 100.0)
-            while round(gtc_shares * gtc_price, 4) < 1.00:
-                gtc_shares = round(gtc_shares + 0.01, 2)
+            gtd_shares = max(min_shares, math.ceil((safe_usd / gtd_price) * 100.0) / 100.0)
+            while round(gtd_shares * gtd_price, 4) < 1.00:
+                gtd_shares = round(gtd_shares + 0.01, 2)
 
-            log_message(f"LIVE copy attempt #{attempt_num} for {side}: placing GTC limit order for {gtc_shares:.2f} shares @ {gtc_price:.4f}...")
+            market_end = trade.get("end_ts") or 0
+            expiration = int(max(time.time() + 300, market_end))
 
-            gtc_res = await asyncio.to_thread(clob_trader.place_limit_buy, token_id, gtc_shares, gtc_price)
+            log_message(f"LIVE copy attempt #{attempt_num} for {side}: placing GTD limit order for {gtd_shares:.2f} shares @ {gtd_price:.4f} (exp: {expiration})...")
 
-            if gtc_res.get("ok") and gtc_res.get("order_id"):
-                order_id = gtc_res["order_id"]
+            gtd_res = await asyncio.to_thread(clob_trader.place_limit_buy, token_id, gtd_shares, gtd_price, expiration)
+
+            if gtd_res.get("ok") and gtd_res.get("order_id"):
+                order_id = gtd_res["order_id"]
                 order_placed_ts = time.time()
-                trade["live_status"] = "GTC_OPEN"
+                trade["live_status"] = "GTD_OPEN"
                 trade["live_order_id"] = order_id
-                trade["live_limit_price"] = gtc_price
+                trade["live_limit_price"] = gtd_price
                 trade["live_quoted_price"] = current_ask
+                trade["live_expiration"] = expiration
                 save_state()
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
-                log_message(f"LIVE GTC limit order placed for {side}: {gtc_shares:.2f} shares @ {gtc_price:.4f} (order {order_id}) — resting on book")
+                log_message(f"LIVE GTD limit order placed for {side}: {gtd_shares:.2f} shares @ {gtd_price:.4f} (order {order_id}) — resting on book")
 
-                # Monitor GTC order until filled, window expires (<15s), or 4s re-quote timeout
-                while trade["status"] == "OPEN" and trade.get("live_status") == "GTC_OPEN":
+                # Monitor GTD order until filled, window expires (<15s), or 4s re-quote timeout
+                while trade["status"] == "OPEN" and trade.get("live_status") == "GTD_OPEN":
                     now_ts = time.time()
                     if trade.get("end_ts") and now_ts >= trade["end_ts"]:
-                        log_message(f"Cancelling resting GTC order {order_id}: window expired")
-                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtc_price, "GTC")
+                        log_message(f"Cancelling resting GTD order {order_id}: window expired")
+                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         if not filled:
                             trade["live_status"] = "TIMEOUT"
                             save_state()
@@ -882,11 +890,11 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                             total_shares = sum(float(f["size"]) for f in fills)
                             total_usd = sum(float(f["size"]) * float(f["price"]) for f in fills)
                             fill_size = total_shares
-                            fill_price = total_usd / total_shares if total_shares > 0 else float(ord_status.get("price") or gtc_price)
+                            fill_price = total_usd / total_shares if total_shares > 0 else float(ord_status.get("price") or gtd_price)
                             fill_usd = total_usd
                         else:
-                            fill_size = float(ord_status.get("size_matched") or gtc_shares)
-                            fill_price = float(ord_status.get("price") or gtc_price)
+                            fill_size = float(ord_status.get("size_matched") or gtd_shares)
+                            fill_price = float(ord_status.get("price") or gtd_price)
                             fill_usd = fill_size * fill_price
 
                         trade["live_status"] = "FILLED"
@@ -911,24 +919,24 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                         _sync_active_trades_to_latest_data()
                         await broadcast_state()
 
-                        msg = (f"LIVE trade FILLED via GTC limit (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
+                        msg = (f"LIVE trade FILLED via GTD limit (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
                                f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {order_id})")
                         log_message(msg)
-                        await send_telegram(f"🚀 *LIVE Copy FILLED (GTC Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
+                        await send_telegram(f"🚀 *LIVE Copy FILLED (GTD Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
                         return
 
                     # Check if partial fill happened while resting on book
                     matched = ord_status.get("size_matched", 0.0)
                     if matched > 0 and matched != trade.get("live_shares"):
                         trade["live_shares"] = matched
-                        trade["live_entry_price"] = float(ord_status.get("price") or gtc_price)
+                        trade["live_entry_price"] = float(ord_status.get("price") or gtd_price)
                         save_state()
                         _sync_active_trades_to_latest_data()
                         await broadcast_state()
 
                     # Explicit cancellation confirmed from exchange
                     if st == "CANCELLED":
-                        await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtc_price, "GTC")
+                        await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         return
 
                     # Check if market ask has surged above our resting limit price
@@ -936,9 +944,9 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     if now_ts - order_placed_ts >= 1.5:
                         ws_sum = polymarket_clob_ws.get_summary(token_id, max_age_s=5.0)
                         ws_ask = ws_sum.get("bestAsk") if ws_sum else None
-                        if ws_ask and ws_ask > gtc_price:
-                            log_message(f"Market ask surged ({ws_ask:.4f} > limit {gtc_price:.4f}) — cancelling resting GTC early to re-quote at fresh ask...")
-                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtc_price, "GTC")
+                        if ws_ask and ws_ask > gtd_price:
+                            log_message(f"Market ask surged ({ws_ask:.4f} > limit {gtd_price:.4f}) — cancelling resting GTD early to re-quote at fresh ask...")
+                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                             if filled:
                                 return
                             if attempt_num < max_attempts:
@@ -948,17 +956,17 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     # 4-Second Resting Lifetime:
                     # Enforce the full 4.0s resting window. Once reached, cancel and verify all partial fills!
                     if now_ts - order_placed_ts >= 4.0:
-                        log_message(f"Resting GTC order {order_id} reached 4s timeout — verifying fills and cancelling on exchange...")
-                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtc_price, "GTC")
+                        log_message(f"Resting GTD order {order_id} reached 4s timeout — verifying fills and cancelling on exchange...")
+                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         if filled:
                             return
 
                         if attempt_num < max_attempts:
-                            log_message(f"Resting GTC order {order_id} cancelled on exchange — re-quoting at freshest ask (attempt #{attempt_num + 1})...")
+                            log_message(f"Resting GTD order {order_id} cancelled on exchange — re-quoting at freshest ask (attempt #{attempt_num + 1})...")
                             trade["live_status"] = "FILLING"
                             break
                         else:
-                            log_message(f"GTC order {order_id} cancelled on exchange after max attempts ({max_attempts}) — stopping order placement for this window to prevent duplicate entry.")
+                            log_message(f"GTD order {order_id} cancelled on exchange after max attempts ({max_attempts}) — stopping order placement for this window to prevent duplicate entry.")
                             trade["live_status"] = "CANCELLED"
                             save_state()
                             _sync_active_trades_to_latest_data()
@@ -970,7 +978,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 if trade.get("live_status") == "FILLED":
                     return
             else:
-                err = clob_trader.enrich_order_error(str(gtc_res.get("error", "gtc_placement_failed")))
+                err = clob_trader.enrich_order_error(str(gtd_res.get("error", "gtd_placement_failed")))
                 if any(k in err for k in ("setup_failed", "client_not_ready", "invalid_private_key", "not enough balance", "balance is not enough")):
                     trade["live_status"] = "FAILED"
                     log_message(f"LIVE copy aborted: {err}")
@@ -979,7 +987,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     await broadcast_state()
                     return
 
-                log_message(f"LIVE copy attempt #{attempt_num} for {side} GTC placement failed: {err} — retrying in {int(retry_interval * 1000)}ms...")
+                log_message(f"LIVE copy attempt #{attempt_num} for {side} GTD placement failed: {err} — retrying in {int(retry_interval * 1000)}ms...")
 
             await asyncio.sleep(retry_interval)
     finally:
@@ -1083,7 +1091,7 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             "paper_closed_time": None,
             "paper_profit_loss": None,
 
-            # ── Live execution (continuous GTC copy worker) ───────────────────
+            # ── Live execution (continuous GTD copy worker) ───────────────────
             "live_status": "FILLING" if settings.PRIVATE_KEY else "NO_CREDS",
             "live_attempts": 0,
             "live_entry_price": None,
@@ -1186,7 +1194,8 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     if trade.get("live_status") == "FILLED" and trade.get("live_shares"):
         token_id = token_ids.get(held_key)
         sell_shares = float(trade["live_shares"])
-        result = await asyncio.to_thread(clob_trader.place_limit_sell, token_id, sell_shares, exit_price)
+        exp = int(max(time.time() + 300, trade.get("end_ts") or 0))
+        result = await asyncio.to_thread(clob_trader.place_limit_sell, token_id, sell_shares, exit_price, exp)
         if not result.get("ok"):
             log_message(f"FLIP ABORTED: Live sell of {trade['side']} failed ({result.get('error')}) — holding position to prevent self-hedging")
             return None
@@ -1196,17 +1205,17 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
         trade["live_exit_order_id"] = result.get("order_id")
         trade["live_profit_loss"] = (sell_shares * live_fill_px) - float(trade.get("live_amount") or 0.0)
         log_message(f"FLIP: Live {trade['side']} sold @ {live_fill_px:.4f} (Live P/L ${trade['live_profit_loss']:.2f})")
-    elif trade.get("live_status") in ("FILLING", "GTC_OPEN"):
+    elif trade.get("live_status") in ("FILLING", "GTD_OPEN"):
         order_id = trade.get("live_order_id")
         token_id = token_ids.get(held_key)
         if order_id:
-            log_message(f"FLIP: Cancelling resting GTC order {order_id}")
+            log_message(f"FLIP: Cancelling resting GTD order {order_id}")
             await asyncio.to_thread(clob_trader.cancel_order, order_id)
             fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id) if token_id else []
             if fills:
                 filled_shares = sum(float(f["size"]) for f in fills)
                 if filled_shares > 0:
-                    log_message(f"FLIP: Resting GTC had {filled_shares:.2f} filled shares — selling before flip")
+                    log_message(f"FLIP: Resting GTD had {filled_shares:.2f} filled shares — selling before flip")
                     sell_res = await asyncio.to_thread(clob_trader.place_limit_sell, token_id, filled_shares, exit_price)
                     if not sell_res.get("ok"):
                         log_message(f"FLIP ABORTED: Live sell of partial fills failed ({sell_res.get('error')}) — holding to prevent self-hedging")
@@ -1663,6 +1672,10 @@ def entry_block_reason(ctx: Dict[str, Any]) -> Optional[str]:
     _mslug = str(_mkt.get("slug") or "")
     _sms = ctx.get("start_ms")
 
+    timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+    if _sms is not None and int(_sms) != int(timing["startMs"]):
+        return "window_expired"
+
     # In-flight check for this market
     if (_mid and _mid in _in_flight_markets) or (_mslug and _mslug in _in_flight_markets):
         return "slot_busy"
@@ -1697,6 +1710,31 @@ async def evaluate_entry(reason: str = "event"):
         ctx = state.get("trade_ctx")
         if not ctx:
             return
+
+        timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+        cur_start_ms = timing["startMs"]
+
+        # Strict window check: never evaluate trades using stale previous window context!
+        if ctx.get("start_ms") != cur_start_ms:
+            state["trade_ctx"] = None
+            return
+
+        # Strict market expiry check
+        mkt = ctx.get("market") or {}
+        end_date = mkt.get("endDate")
+        if end_date:
+            try:
+                end_ts = datetime.fromisoformat(str(end_date).replace('Z', '+00:00')).timestamp()
+                if now >= end_ts - 5.0:
+                    state["trade_ctx"] = None
+                    return
+            except Exception:
+                pass
+
+        if not ctx.get("strike_open") or not ctx.get("target_open"):
+            state["trade_ctx"] = None
+            return
+
         if now - ctx.get("built_at", 0) > CTX_MAX_AGE_S:
             return
 
@@ -1837,6 +1875,21 @@ async def update_loop():
     while True:
         try:
             timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
+            cur_window_start_ms = int(timing["startMs"])
+            prev_window_start_ms = state.get("last_window_start")
+
+            # ── WINDOW ROLLOVER DETECTED ──
+            # A new 15-minute window has begun (:00, :15, :30, :45).
+            # Purge all stale context, cached market, and previous window odds immediately
+            # so the bot NEVER uses old window data to calculate signals or enter trades!
+            if prev_window_start_ms is not None and cur_window_start_ms != prev_window_start_ms:
+                state["trade_ctx"] = None
+                _cached_market = None
+                _cached_market_ts = 0.0
+                state["last_poly_up"] = None
+                state["last_poly_down"] = None
+                polymarket_clob_ws.reset_books()
+                log_message(f"Window rollover detected: new window started at {datetime.fromtimestamp(cur_window_start_ms / 1000).strftime('%H:%M:%S')}. Cleared old window context.")
 
             binance_ws = binance_stream.get_last()
             if not binance_ws.get("price"):
@@ -1874,19 +1927,6 @@ async def update_loop():
                 if now_t - state.get("_last_seed_kline_ts", 0) > 10.0:
                     state["_last_seed_kline_ts"] = now_t
                     asyncio.create_task(seed_kline_buffers())
-            # Debounced live wallet balance refresh (every 30s) without blocking event loop
-            if settings.PRIVATE_KEY and (time.time() - state.get("last_balance_refresh", 0)) > 30.0:
-                state["last_balance_refresh"] = time.time()
-                async def _bg_bal():
-                    try:
-                        bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
-                        if bal is not None and bal >= 0:
-                            state["live_balance"] = bal
-                            if "trading_state" in state.get("latest_data", {}):
-                                state["latest_data"]["trading_state"]["balance"] = bal
-                    except Exception:
-                        pass
-                asyncio.create_task(_bg_bal())
 
             mc_steps = max(1, math.ceil(timing["remainingMinutes"] / 5))
 
@@ -1944,26 +1984,17 @@ async def update_loop():
             model_open = model_open or win.get("binance") or spot_price
             target_open = model_open if strike_open is not None else None
 
-            drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
-            fair_data = {
-                "prob_up": fair_up,
-                "prob_down": 1.0 - fair_up,
-                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
-                "sigma_5m": sigma_5m,
-            }
-
             settlement_ms = None
             if poly_snapshot.get("ok") and poly_snapshot.get("market") and poly_snapshot["market"].get("endDate"):
                 try:
                     settlement_ms = datetime.fromisoformat(poly_snapshot["market"]["endDate"].replace('Z', '+00:00')).timestamp() * 1000
+                    if settlement_ms <= time.time() * 1000:
+                        poly_snapshot["ok"] = False
                 except Exception:
                     settlement_ms = None
 
             now_ms = time.time() * 1000
             if settlement_ms is not None:
-                # If market has a known settlement timestamp, respect it strictly: expired means 0.0 minutes left!
                 time_left_min = max(0.0, (settlement_ms - now_ms) / 60_000)
             else:
                 time_left_min = max(0.0, timing["remainingMinutes"])
@@ -2000,13 +2031,6 @@ async def update_loop():
             market_implied_up = None
             if market_up is not None and market_down is not None and (market_up + market_down) > 0:
                 market_implied_up = market_up / (market_up + market_down)
-            edge = {
-                "marketUp": market_implied_up,
-                "marketDown": (1 - market_implied_up) if market_implied_up is not None else None,
-                "edgeUp": (fair_up - market_implied_up) if market_implied_up is not None else None,
-                "edgeDown": ((1 - fair_up) - (1 - market_implied_up)) if market_implied_up is not None else None,
-            }
-            prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
             EB = engines.EXHAUSTION_BARS
             def _is(color, count, want):
@@ -2015,20 +2039,47 @@ async def update_loop():
             ha_exhausted_green = _is(consec["color"], consec["count"], "green") or _is(consec_5m["color"], consec_5m["count"], "green")
             ha_exhausted_red = _is(consec["color"], consec["count"], "red") or _is(consec_5m["color"], consec_5m["count"], "red")
 
-            decision = engines.decide_ev({
-                "mcProbUp": fair_up,
-                "priceUp": market_up,
-                "priceDown": market_down,
-                "minProb": settings.MIN_PROB_EV,
-                "evThreshold": settings.EV_THRESHOLD,
-                "rsi": rsi_now,
-                "haExhaustedGreen": ha_exhausted_green,
-                "haExhaustedRed": ha_exhausted_red,
-            })
+            since_start = (time.time() * 1000) - start_ms
+            if strike_open is None or target_open is None:
+                fair_up = 0.50
+                drift_5m, sigma_5m = (0.0, None)
+                if since_start < MARK_CAPTURE_WINDOW_MS:
+                    decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "waiting_new_window_strike"}
+                else:
+                    decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "no_strike_window_skipped"}
+            else:
+                drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
+                fair_up = indicators.fair_prob_up(spot_price or 0, target_open, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
+                decision = engines.decide_ev({
+                    "mcProbUp": fair_up,
+                    "priceUp": market_up,
+                    "priceDown": market_down,
+                    "minProb": settings.MIN_PROB_EV,
+                    "evThreshold": settings.EV_THRESHOLD,
+                    "rsi": rsi_now,
+                    "haExhaustedGreen": ha_exhausted_green,
+                    "haExhaustedRed": ha_exhausted_red,
+                })
 
-            # Publish trade_ctx for event watcher early entries
-            if poly_snapshot.get("ok"):
-                # Pre-warm active market tokens in RAM so fee & tick metadata are 0ms cached
+            fair_data = {
+                "prob_up": fair_up,
+                "prob_down": 1.0 - fair_up,
+                "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
+                "steps": mc_steps,
+                "sigma_5m": sigma_5m,
+            }
+
+            edge = {
+                "marketUp": market_implied_up,
+                "marketDown": (1 - market_implied_up) if market_implied_up is not None else None,
+                "edgeUp": (fair_up - market_implied_up) if market_implied_up is not None else None,
+                "edgeDown": ((1 - fair_up) - (1 - market_implied_up)) if market_implied_up is not None else None,
+            }
+            prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
+
+            # Publish trade_ctx ONLY IF new window strike is genuinely captured and market is valid!
+            if (poly_snapshot.get("ok") and strike_open is not None and target_open is not None
+                    and poly_snapshot.get("market") and time_left_min > 0.1):
                 tok_up = poly_snapshot.get("token_ids", {}).get("up")
                 tok_down = poly_snapshot.get("token_ids", {}).get("down")
                 if tok_up:
@@ -2065,13 +2116,15 @@ async def update_loop():
                     "market": poly_snapshot["market"],
                     "market_ok": True,
                     "price_is_fresh": price_is_fresh,
-                    "slot_busy": any(str(t.get("market_id")) == str(poly_snapshot["market"].get("id")) for t in state["active_trades"]) if (poly_snapshot.get("ok") and poly_snapshot.get("market")) else False,
+                    "slot_busy": any(str(t.get("market_id")) == str(poly_snapshot["market"].get("id")) for t in state["active_trades"]),
                 }
+            else:
+                state["trade_ctx"] = None
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
             exec_result = None
-            if poly_snapshot["ok"] and state["running"] and state["withdraw_state"] != "in_progress":
+            if poly_snapshot.get("ok") and state["running"] and state["withdraw_state"] != "in_progress":
                 flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
                 exec_result = await execute_trade(
                     decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
@@ -2124,7 +2177,21 @@ async def update_loop():
                     t["live_mark_price"] = None
                     t["live_unrealized_pl"] = None
 
-            # Live balance maintained with 0ms delay by background live_balance_updater
+            # Live balance refresh: every 30 seconds directly in update_loop (safe, debounced, never hangs)
+            if settings.PRIVATE_KEY:
+                now_ts = time.time()
+                if now_ts - state.get("last_balance_refresh", 0) > 30.0:
+                    state["last_balance_refresh"] = now_ts
+                    real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
+                    if real_bal is not None:
+                        state["live_balance"] = real_bal
+                        risk_type = (settings.RISK_TYPE or "percent").lower()
+                        if risk_type == "fixed":
+                            stake = float(settings.RISK_VALUE)
+                        else:
+                            stake = (float(settings.RISK_VALUE) / 100.0) * real_bal
+                        state["precomputed_live_stake"] = round(max(1.0, min(stake, real_bal)) if real_bal >= 1.0 else 0.0, 2)
+
             live_balance = float(state.get("live_balance") or 0.0)
             total_equity = live_balance + live_open_value
             await maybe_auto_withdraw(total_equity, poly_snapshot)
@@ -2248,7 +2315,7 @@ async def lifespan(app: FastAPI):
     polymarket_clob_ws.close()
     chainlink_ws_stream.close()
 
-app = FastAPI(title="Polymarket BTC 15m Assistant [GTC]", lifespan=lifespan)
+app = FastAPI(title="Polymarket BTC 15m Assistant [GTD]", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
 @app.websocket("/ws")
@@ -2350,8 +2417,8 @@ async def stop_trading():
     state["running"] = False
     _reflect_running_now()
     for t in state.get("active_trades", []):
-        if t.get("live_status") == "GTC_OPEN" and t.get("live_order_id"):
-            log_message(f"Cancelling resting GTC order {t['live_order_id']} on trading stop")
+        if t.get("live_status") == "GTD_OPEN" and t.get("live_order_id"):
+            log_message(f"Cancelling resting GTD order {t['live_order_id']} on trading stop")
             asyncio.create_task(asyncio.to_thread(clob_trader.cancel_order, t["live_order_id"]))
             t["live_status"] = "CANCELLED"
     log_message("Trading STOPPED by user")
@@ -2885,5 +2952,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8082))
+    port = int(os.getenv("PORT", 8050))
     uvicorn.run(app, host="0.0.0.0", port=port)
