@@ -160,11 +160,15 @@ fn build_signed_order_internal(
         (frac * (timestamp_ms as f64)) as u64
     });
 
-    // Polymarket CLOB V2 rule: order.signer MUST match the EOA address that derived
-    // and owns the L2 API Key (POLY_ADDRESS header).
-    // order.maker is st.funder_checksum (the deposit wallet, proxy, safe, or EOA).
-    let signer_bytes = &st.eoa_bytes;
-    let signer_checksum = &st.eoa_checksum;
+    // Polymarket CLOB V2 rule:
+    // For Deposit Wallets (signature_type == 3 / POLY_1271), the verifying contract is the
+    // deposit wallet itself; Polymarket requires order.signer to match the deposit wallet contract (st.funder).
+    // For direct EOA (0), Poly proxy (1), or Safe (2), order.signer is the EOA (st.eoa_checksum).
+    let (signer_bytes, signer_checksum) = if st.signature_type == 3 {
+        (&st.funder_bytes, &st.funder_checksum)
+    } else {
+        (&st.eoa_bytes, &st.eoa_checksum)
+    };
 
     let token_id_be = parse_u256_be(token_id)?;
 

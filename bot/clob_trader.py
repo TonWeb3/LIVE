@@ -84,7 +84,7 @@ def _patch_order_builder():
         OrderBuilder.get_market_order_amounts = safe_get_market_order_amounts
 
         # Polymarket CLOB V2 rule: order.signer MUST match the EOA owning the API key
-        OrderBuilder._v2_order_signer = lambda self: self.signer.address()
+        # OrderBuilder._v2_order_signer left unpatched: returns self.funder for POLY_1271 (signature_type 3)
     except Exception as e:
         print(f"Warning: Failed to patch OrderBuilder: {e}")
 
@@ -343,6 +343,28 @@ class ClobTrader:
         6. Direct EOA Signer (st=0)
         Never includes unverified counterparty maker addresses from market trades."""
         out: List[Tuple[int, str, str]] = []
+
+        # 0. Recent trade history discovery directly from Polymarket CLOB
+        try:
+            creds = self._derive_creds()
+            from polymarket_apis.clients.clob_client import PolymarketClobClient
+            from web3 import Web3
+            eoa_probe = None
+            try:
+                from eth_account import Account
+                eoa_probe = Account.from_key(settings.PRIVATE_KEY).address
+            except Exception:
+                pass
+            client_probe = PolymarketClobClient(private_key=settings.PRIVATE_KEY, address=eoa_probe or "0x0000000000000000000000000000000000000000", chain_id=137)
+            client_probe.set_api_creds(creds)
+            recent_trades = client_probe.get_trades()
+            if recent_trades and len(recent_trades) > 0:
+                trade_maker = getattr(recent_trades[0], "maker_address", None)
+                if trade_maker and trade_maker.startswith("0x") and len(trade_maker) == 42:
+                    chk_maker = Web3.to_checksum_address(trade_maker)
+                    out.append((3, chk_maker, "Polymarket Trade History Deposit Wallet"))
+        except Exception:
+            pass
 
         # Explicit user override
         explicit_funder = getattr(settings, "FUNDER_ADDRESS", "").strip()
