@@ -136,68 +136,21 @@ _patch_order_builder()
 _patch_crypto_signing()
 
 
+_CACHED_RUST_MOD = None
+
+
 def _ensure_rust_clob():
-    """Ensure the native Rust `rust_clob` extension is compiled and imported for the
-    current OS/CPU architecture. If not yet installed or if source files were modified,
-    automatically rebuilds `./rust_clob` via pip."""
-    import os
-    import sys
-    import shutil
-    import subprocess
-    import importlib
-
-    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    crate_dir = os.path.join(proj_root, "rust_clob")
-    src_file = os.path.join(crate_dir, "src", "lib.rs")
-    cargo_file = os.path.join(crate_dir, "Cargo.toml")
-
-    rebuild_needed = False
+    """Return the cached native Rust `rust_clob` extension module.
+    Cached in RAM after first import — executes in sub-microsecond time with zero filesystem I/O."""
+    global _CACHED_RUST_MOD
+    if _CACHED_RUST_MOD is not None:
+        return _CACHED_RUST_MOD
     try:
         import rust_clob
-        mod_file = getattr(rust_clob, "__file__", None)
-        if mod_file and os.path.exists(mod_file):
-            bin_mtime = os.path.getmtime(mod_file)
-            for src_p in (src_file, cargo_file):
-                if os.path.exists(src_p) and os.path.getmtime(src_p) > bin_mtime:
-                    rebuild_needed = True
-                    break
-        if not rebuild_needed:
-            return rust_clob
-    except ImportError:
-        rebuild_needed = True
-
-    if not os.path.isdir(crate_dir):
-        raise RuntimeError(f"Missing rust_clob crate directory at {crate_dir}")
-
-    env = os.environ.copy()
-    cargo_bin = os.path.expanduser("~/.cargo/bin")
-    if os.path.isdir(cargo_bin) and cargo_bin not in env.get("PATH", ""):
-        env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
-
-    if not shutil.which("cargo", path=env.get("PATH")):
-        if os.name != "nt":
-            print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
-            subprocess.run(
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
-                shell=True,
-                check=True,
-                env=env,
-            )
-            env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
-        else:
-            raise RuntimeError("Rust toolchain (cargo) not found in PATH.")
-
-    print(f"[rust_clob] Compiling/reinstalling native Rust extension from {crate_dir} ...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", crate_dir],
-        check=True,
-        env=env,
-    )
-    if "rust_clob" in sys.modules:
-        import rust_clob
-        return importlib.reload(rust_clob)
-    import rust_clob
-    return rust_clob
+        _CACHED_RUST_MOD = rust_clob
+        return _CACHED_RUST_MOD
+    except Exception as e:
+        raise RuntimeError(f"rust_clob native module not available: {e}")
 
 
 def derive_beacon_deposit_wallet(eoa_address: str) -> str:
@@ -512,27 +465,21 @@ class ClobTrader:
         except Exception:
             pass
 
-        # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender (optional accelerator)
-        self._rust_ready = False
-        try:
-            rust_mod = _ensure_rust_clob()
-            if rust_mod:
-                pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
-                creds = clob.creds
-                rust_mod.init_client(
-                    str(pk_hex),
-                    str(funder),
-                    int(sig_type),
-                    str(creds.key),
-                    str(creds.secret),
-                    str(creds.passphrase),
-                    str(clob.base_url),
-                    137,
-                )
-                self._rust_ready = True
-        except Exception as e:
-            print(f"[clob_trader] Note: rust_clob native sender unavailable ({e}), using optimized Python/C signing.")
-            self._rust_ready = False
+        # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender
+        rust_mod = _ensure_rust_clob()
+        pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
+        creds = clob.creds
+        rust_mod.init_client(
+            str(pk_hex),
+            str(funder),
+            int(sig_type),
+            str(creds.key),
+            str(creds.secret),
+            str(creds.passphrase),
+            str(clob.base_url),
+            137,
+        )
+        self._rust_ready = True
 
         self.gasless = gasless
         self.clob = clob
@@ -543,13 +490,13 @@ class ClobTrader:
 
     def is_ready(self) -> bool:
         """Check if CLOB client is initialized and ready without triggering blocking setup."""
-        return bool(self.ready and self.clob is not None)
+        return bool(self.ready and self.clob is not None and self._rust_ready)
 
     def ensure_ready(self) -> bool:
-        if self.ready and self.clob is not None:
+        if self.ready and self.clob is not None and self._rust_ready:
             return True
         with self._lock:
-            if self.ready and self.clob is not None:
+            if self.ready and self.clob is not None and self._rust_ready:
                 return True
             if not settings.PRIVATE_KEY:
                 self.last_error = "missing_private_key"
@@ -671,39 +618,18 @@ class ClobTrader:
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
-            data = None
-            if getattr(self, "_rust_ready", False):
-                try:
-                    side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
-                        "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
-                    )
-                    data = self._post_order_fast(
-                        token_id=str(token_id),
-                        maker_amount=maker_amt,
-                        taker_amount=taker_amt,
-                        side_int=side_int,
-                        order_type_str="GTD",
-                        expiration_str=str(exp),
-                        neg_risk=False,
-                    )
-                except Exception as rust_err:
-                    print(f"[clob_trader] Warning: Rust fast sender ({rust_err}), falling back to Python SDK...")
-                    data = None
-
-            if not data:
-                from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-                args = OrderArgs(
-                    token_id=str(token_id),
-                    price=order_price,
-                    size=order_size,
-                    side="BUY",
-                    expiration=exp
-                )
-                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-                resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
-                if resp is None:
-                    return {"ok": False, "error": "no_response_from_clob"}
-                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                "BUY", order_size, order_price, ROUNDING_CONFIG["0.01"]
+            )
+            data = self._post_order_fast(
+                token_id=str(token_id),
+                maker_amount=maker_amt,
+                taker_amount=taker_amt,
+                side_int=side_int,
+                order_type_str="GTD",
+                expiration_str=str(exp),
+                neg_risk=False,
+            )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
@@ -735,39 +661,18 @@ class ClobTrader:
             order_size = round(float(size), 2)
             exp = int(expiration) if expiration and expiration > (time.time() + 180) else int(time.time() + 300)
             self.warm_token(token_id)
-            data = None
-            if getattr(self, "_rust_ready", False):
-                try:
-                    side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
-                        "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
-                    )
-                    data = self._post_order_fast(
-                        token_id=str(token_id),
-                        maker_amount=maker_amt,
-                        taker_amount=taker_amt,
-                        side_int=side_int,
-                        order_type_str="GTD",
-                        expiration_str=str(exp),
-                        neg_risk=False,
-                    )
-                except Exception as rust_err:
-                    print(f"[clob_trader] Warning: Rust fast sender ({rust_err}), falling back to Python SDK...")
-                    data = None
-
-            if not data:
-                from polymarket_apis.types.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-                args = OrderArgs(
-                    token_id=str(token_id),
-                    price=order_price,
-                    size=order_size,
-                    side="SELL",
-                    expiration=exp
-                )
-                opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-                resp = self.clob.create_and_post_order(args, options=opts, order_type=OrderType.GTD)
-                if resp is None:
-                    return {"ok": False, "error": "no_response_from_clob"}
-                data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+            side_int, maker_amt, taker_amt = self.clob.builder.get_order_amounts(
+                "SELL", order_size, order_price, ROUNDING_CONFIG["0.01"]
+            )
+            data = self._post_order_fast(
+                token_id=str(token_id),
+                maker_amount=maker_amt,
+                taker_amount=taker_amt,
+                side_int=side_int,
+                order_type_str="GTD",
+                expiration_str=str(exp),
+                neg_risk=False,
+            )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
             return {
