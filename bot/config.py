@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # ── Copy-trader continuous GTD execution ───────────────────────────────────
     COPY_RETRY_INTERVAL_MS: int = 300
     COPY_MAX_RETRIES: int = 5
+    COPY_RESTING_TIMEOUT_S: float = 2.0
 
     # ── Live trading (Polymarket CLOB V2) ───────────────────────────────────────
     # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
@@ -161,6 +162,7 @@ def load_settings():
                 ct = config_data["copy_trader"]
                 if "retry_interval_ms" in ct: base_settings.COPY_RETRY_INTERVAL_MS = int(ct["retry_interval_ms"])
                 if "max_retries" in ct: base_settings.COPY_MAX_RETRIES = int(ct["max_retries"])
+                if "resting_timeout_s" in ct: base_settings.COPY_RESTING_TIMEOUT_S = float(ct["resting_timeout_s"])
 
             if "relayer" in config_data:
                 rl = config_data["relayer"]

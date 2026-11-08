@@ -2,7 +2,8 @@
     "private_key": "",
     "copy_trader": {
         "retry_interval_ms": 300,
-        "max_retries": 5
+        "max_retries": 5,
+        "resting_timeout_s": 2.0
     },
     "live": {
         "max_slippage": 0.05,

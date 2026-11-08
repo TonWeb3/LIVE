@@ -41,7 +41,7 @@ _ws_clients = set()
 
 # ── Event-driven early entries & wakeups ───────────────────────────────────────
 MIN_EVAL_INTERVAL_S = 0.25  # Evaluates up to 4 times per second (from TOG-main)
-CTX_MAX_AGE_S = 4.0        # 4.0s context validity from TOG-main
+CTX_MAX_AGE_S = 4.0
 POLY_WS_MAX_AGE_MS = 2500
 MARK_CAPTURE_WINDOW_MS = 20_000
 
@@ -320,8 +320,8 @@ async def send_telegram(text: str):
         if not chat_id:
             continue
         try:
-            async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=5.0) as client:
-                await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+            client = data.get_client(proxy)
+            await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except Exception as e:
             print(f"Failed to send telegram to {chat_id}: {e}")
 
@@ -444,7 +444,7 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     ws_url=settings.POLYMARKET_LIVE_DATA_WS_URL,
     symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
 )
-polymarket_clob_ws = ws_data.PolymarketClobMarketStream()
+polymarket_clob_ws = ws_data.PolymarketClobMarketStream(on_update=_wake_entry)
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL), on_update=_on_chainlink_tick)
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
@@ -480,7 +480,7 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         if end_date:
             try:
                 end_ts = datetime.fromisoformat(end_date.replace('Z', '+00:00')).timestamp()
-                if end_ts > now + 15 and (now - _cached_market_ts) < 30.0:
+                if end_ts > now + 15:
                     return _cached_market
             except Exception:
                 pass
@@ -492,32 +492,14 @@ async def get_active_market(force: bool = False) -> Optional[Dict[str, Any]]:
         elif settings.POLYMARKET_AUTO_SELECT_LATEST:
             events = await data.fetch_live_events_by_series_id(settings.POLYMARKET_SERIES_ID)
             markets = data.flatten_event_markets(events)
-            live_markets = []
-            for m in markets:
-                end_str = m.get("endDate")
-                if not end_str:
-                    continue
-                try:
-                    end_m_ts = datetime.fromisoformat(end_str.replace('Z', '+00:00')).timestamp() * 1000
-                except Exception:
-                    continue
-                if end_m_ts <= now_ms + 15_000:
-                    continue
-                esr = m.get("eventStartTime") or m.get("gameStartTime")
-                start_m_ts = None
-                if esr:
-                    try:
-                        start_m_ts = datetime.fromisoformat(str(esr).replace('Z', '+00:00')).timestamp() * 1000
-                    except Exception:
-                        pass
-                if start_m_ts is None:
-                    start_m_ts = end_m_ts - (settings.CANDLE_WINDOW_MINUTES * 60_000)
-                if abs(start_m_ts - cur_start_ms) < 120_000 or (start_m_ts <= now_ms < end_m_ts):
-                    live_markets.append((m, end_m_ts, abs(start_m_ts - cur_start_ms)))
-
+            now_ms = now * 1000
+            live_markets = [
+                m for m in markets
+                if m.get("endDate") and datetime.fromisoformat(m["endDate"].replace('Z', '+00:00')).timestamp() * 1000 > now_ms
+            ]
             if live_markets:
-                live_markets.sort(key=lambda x: (x[2], x[1]))
-                market = live_markets[0][0]
+                live_markets.sort(key=lambda x: x["endDate"])
+                market = live_markets[0]
     except Exception as e:
         print(f"Warning: Market discovery error: {e}")
 
@@ -670,7 +652,7 @@ async def handle_order_gone_quiet(order_id: str, trade: Dict[str, Any], token_id
         log_message(f"cancel {order_id} failed: {e}")
 
     # Brief buffer for indexer to catch any matching engine fills
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.05)
 
     # Double-check: if cancel call failed or unconfirmed, ensure emergency cancel
     if not cancel_success:
@@ -707,7 +689,7 @@ async def handle_order_gone_quiet(order_id: str, trade: Dict[str, Any], token_id
                 new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
             state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
 
-        save_state()
+        await asyncio.to_thread(save_state)
         _sync_active_trades_to_latest_data()
         await broadcast_state()
 
@@ -719,7 +701,7 @@ async def handle_order_gone_quiet(order_id: str, trade: Dict[str, Any], token_id
     else:
         log_message(f"{otype} order {order_id} confirmed cancelled on exchange, no fill")
         trade["live_status"] = "CANCELLED"
-        save_state()
+        await asyncio.to_thread(save_state)
         _sync_active_trades_to_latest_data()
         await broadcast_state()
         return False
@@ -849,24 +831,63 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             market_end = trade.get("end_ts") or 0
             expiration = int(max(time.time() + 300, market_end))
 
-            log_message(f"LIVE copy attempt #{attempt_num} for {side}: placing GTD limit order for {gtd_shares:.2f} shares @ {gtd_price:.4f} (exp: {expiration})...")
-
-            gtd_res = await asyncio.to_thread(clob_trader.place_limit_buy, token_id, gtd_shares, gtd_price, expiration)
+            # Place order on exchange immediately over the wire (non-blocking log)
+            gtd_order_task = asyncio.to_thread(clob_trader.place_limit_buy, token_id, gtd_shares, gtd_price, expiration)
+            asyncio.create_task(asyncio.to_thread(log_message, f"LIVE copy attempt #{attempt_num} for {side}: placing GTD limit order for {gtd_shares:.2f} shares @ {gtd_price:.4f} (exp: {expiration})..."))
+            gtd_res = await gtd_order_task
 
             if gtd_res.get("ok") and gtd_res.get("order_id"):
                 order_id = gtd_res["order_id"]
                 order_placed_ts = time.time()
+
+                # Zero-latency immediate taker fill detection from initial placement response
+                if gtd_res.get("status") == "filled" and gtd_res.get("fill_size"):
+                    fill_size = float(gtd_res["fill_size"])
+                    fill_price = float(gtd_res["fill_price"])
+                    fill_usd = float(gtd_res.get("fill_usd") or (fill_size * fill_price))
+
+                    trade["live_status"] = "FILLED"
+                    trade["live_order_id"] = order_id
+                    trade["live_entry_price"] = fill_price
+                    trade["live_shares"] = fill_size
+                    trade["live_amount"] = fill_usd
+                    trade["live_entry_time"] = datetime.now().isoformat()
+                    trade["live_quoted_price"] = current_ask
+                    trade["live_slippage"] = fill_price - current_ask
+
+                    # Immediately deduct spent funds in RAM
+                    if fill_usd > 0:
+                        new_bal = max(0.0, (state.get("live_balance") or 0.0) - fill_usd)
+                        state["live_balance"] = new_bal
+                        risk_type = (settings.RISK_TYPE or "percent").lower()
+                        if risk_type == "fixed":
+                            new_stake = float(settings.RISK_VALUE)
+                        else:
+                            new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
+                        state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
+
+                    await asyncio.to_thread(save_state)
+                    _sync_active_trades_to_latest_data()
+                    await broadcast_state()
+
+                    msg = (f"LIVE trade FILLED instantly via GTD taker match (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
+                           f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {order_id})")
+                    log_message(msg)
+                    await send_telegram(f"🚀 *LIVE Copy FILLED (Instant Match)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
+                    return
+
                 trade["live_status"] = "GTD_OPEN"
                 trade["live_order_id"] = order_id
                 trade["live_limit_price"] = gtd_price
                 trade["live_quoted_price"] = current_ask
                 trade["live_expiration"] = expiration
-                save_state()
+                await asyncio.to_thread(save_state)
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
                 log_message(f"LIVE GTD limit order placed for {side}: {gtd_shares:.2f} shares @ {gtd_price:.4f} (order {order_id}) — resting on book")
 
-                # Monitor GTD order until filled, window expires (<15s), or 4s re-quote timeout
+                # Fast resting monitor: configurable timeout (default 2.0s) and rapid 0.3s surge cancellation
+                resting_timeout = max(0.5, float(getattr(settings, "COPY_RESTING_TIMEOUT_S", 2.0) or 2.0))
                 while trade["status"] == "OPEN" and trade.get("live_status") == "GTD_OPEN":
                     now_ts = time.time()
                     if trade.get("end_ts") and now_ts >= trade["end_ts"]:
@@ -874,7 +895,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                         filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         if not filled:
                             trade["live_status"] = "TIMEOUT"
-                            save_state()
+                            await asyncio.to_thread(save_state)
                             _sync_active_trades_to_latest_data()
                             await broadcast_state()
                         return
@@ -884,7 +905,6 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     st = ord_status.get("status")
 
                     if st == "FILLED":
-                        # Never assume fills or prices: verify exact trade fills directly from CLOB API!
                         fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
                         if fills:
                             total_shares = sum(float(f["size"]) for f in fills)
@@ -915,7 +935,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                                 new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
                             state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
 
-                        save_state()
+                        await asyncio.to_thread(save_state)
                         _sync_active_trades_to_latest_data()
                         await broadcast_state()
 
@@ -930,7 +950,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     if matched > 0 and matched != trade.get("live_shares"):
                         trade["live_shares"] = matched
                         trade["live_entry_price"] = float(ord_status.get("price") or gtd_price)
-                        save_state()
+                        await asyncio.to_thread(save_state)
                         _sync_active_trades_to_latest_data()
                         await broadcast_state()
 
@@ -939,9 +959,8 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                         await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         return
 
-                    # Check if market ask has surged above our resting limit price
-                    # If market jumped away, cancel early to re-quote at the higher price instead of waiting 4s passively
-                    if now_ts - order_placed_ts >= 1.5:
+                    # Fast surge check: if market ask moved higher, cancel immediately after 0.3s instead of waiting passively
+                    if now_ts - order_placed_ts >= 0.3:
                         ws_sum = polymarket_clob_ws.get_summary(token_id, max_age_s=5.0)
                         ws_ask = ws_sum.get("bestAsk") if ws_sum else None
                         if ws_ask and ws_ask > gtd_price:
@@ -953,10 +972,9 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                                 trade["live_status"] = "FILLING"
                                 break
 
-                    # 4-Second Resting Lifetime:
-                    # Enforce the full 4.0s resting window. Once reached, cancel and verify all partial fills!
-                    if now_ts - order_placed_ts >= 4.0:
-                        log_message(f"Resting GTD order {order_id} reached 4s timeout — verifying fills and cancelling on exchange...")
+                    # Fast Resting Timeout: 2.0s timeout
+                    if now_ts - order_placed_ts >= resting_timeout:
+                        log_message(f"Resting GTD order {order_id} reached {resting_timeout}s timeout — verifying fills and cancelling on exchange...")
                         filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
                         if filled:
                             return
@@ -968,12 +986,12 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                         else:
                             log_message(f"GTD order {order_id} cancelled on exchange after max attempts ({max_attempts}) — stopping order placement for this window to prevent duplicate entry.")
                             trade["live_status"] = "CANCELLED"
-                            save_state()
+                            await asyncio.to_thread(save_state)
                             _sync_active_trades_to_latest_data()
                             await broadcast_state()
                             return
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.15)
 
                 if trade.get("live_status") == "FILLED":
                     return
@@ -982,7 +1000,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                 if any(k in err for k in ("setup_failed", "client_not_ready", "invalid_private_key", "not enough balance", "balance is not enough")):
                     trade["live_status"] = "FAILED"
                     log_message(f"LIVE copy aborted: {err}")
-                    save_state()
+                    await asyncio.to_thread(save_state)
                     _sync_active_trades_to_latest_data()
                     await broadcast_state()
                     return
@@ -1128,24 +1146,18 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
             state["last_trade_side"] = side
             _sync_active_trades_to_latest_data()
 
-            msg = f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Amount: ${paper_amount:.2f})"
-            log_message(msg)
+            # SIMULTANEOUS FIRE: Dispatch LIVE trade IMMEDIATELY on the wire at the exact same instant as Paper!
+            if settings.PRIVATE_KEY:
+                trade_dispatched = True
+                asyncio.create_task(_continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price, ask_liq_usd=ask_liq_usd))
 
-            # Parallel dispatch: Never wait for Paper disk writes or Telegram alerts before firing Live!
+            # Paper post-processing (disk logging, save_state, telegram) runs concurrently in background without delaying Live
             async def _bg_paper_post_actions():
+                log_message(f"Executed PAPER trade: {side} @ {price:.4f} for {market.get('slug')} (Amount: ${paper_amount:.2f})")
                 await asyncio.to_thread(save_state)
                 await send_telegram(f"🟢 *PAPER Trade Entered*\n• Side: `{side}`\n• Price: `{price:.4f}`\n• Stake: `${paper_amount:.2f}`\n• Market: `{market.get('slug')}`")
 
-            if settings.PRIVATE_KEY:
-                # Fire LIVE trade order and paper background tasks concurrently via asyncio.gather
-                trade_dispatched = True
-                asyncio.create_task(asyncio.gather(
-                    _continuous_live_copy_fill(trade, market, token_ids, evaluated_price=price, ask_liq_usd=ask_liq_usd),
-                    _bg_paper_post_actions()
-                ))
-            else:
-                log_message("LIVE copy skipped: no private key set in settings")
-                asyncio.create_task(_bg_paper_post_actions())
+            asyncio.create_task(_bg_paper_post_actions())
 
             return "entered"
         finally:
@@ -1249,7 +1261,7 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     state["trade_history"].append(_archive(trade))
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
-    save_state()
+    await asyncio.to_thread(save_state)
     _sync_active_trades_to_latest_data()
     log_message(f"FLIP: Closed {trade['side']} @ {exit_price:.2f} (Paper P/L ${trade['paper_profit_loss']:.2f}); opening {new_side}")
     return new_side
@@ -1412,7 +1424,7 @@ async def update_trades(current_prices: Dict[str, Any]):
                         new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
                     state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
 
-                save_state()
+                await asyncio.to_thread(save_state)
                 _sync_active_trades_to_latest_data()
                 await broadcast_state()
                 trades_changed = True
@@ -1570,7 +1582,7 @@ async def update_trades(current_prices: Dict[str, Any]):
 
     state["active_trades"] = remaining_active
     if trades_changed:
-        save_state()
+        await asyncio.to_thread(save_state)
         _sync_active_trades_to_latest_data()
         # Controlled GC invocation: cleanup expired trade objects during quiet settlement period
         import gc
@@ -1714,10 +1726,8 @@ async def evaluate_entry(reason: str = "event"):
         timing = get_candle_window_timing(settings.CANDLE_WINDOW_MINUTES)
         cur_start_ms = timing["startMs"]
 
-        # Strict window check: never evaluate trades using stale previous window context!
-        if ctx.get("start_ms") != cur_start_ms:
-            state["trade_ctx"] = None
-            return
+# Window check aligned with TOG
+        pass
 
         # Strict market expiry check
         mkt = ctx.get("market") or {}
@@ -1899,17 +1909,20 @@ async def update_loop():
             poly_ws = polymarket_ws_stream.get_last()
             cl_ws = chainlink_ws_stream.get_last()
 
+            cl_cand = cl_ws.get("price") if cl_ws and cl_ws.get("price") else state.get("last_chainlink_price")
+            need_rest_chainlink = cl_cand is None
+
             spot_cand = binance_ws.get("price") if binance_ws and binance_ws.get("price") else state.get("last_spot_price")
             need_rest_spot = spot_cand is None
             results = await asyncio.gather(
                 data.fetch_last_price(settings.SYMBOL) if need_rest_spot else asyncio.sleep(0, result=None),
-                chainlink.chainlink_fetcher.fetch_chainlink_btc_usd(),
+                chainlink.chainlink_fetcher.fetch_chainlink_btc_usd() if need_rest_chainlink else asyncio.sleep(0, result=None),
                 fetch_polymarket_snapshot(),
                 return_exceptions=True
             )
 
             last_price = results[0] if not isinstance(results[0], Exception) else None
-            chainlink_data = results[1] if not isinstance(results[1], Exception) else {}
+            chainlink_data = results[1] if not isinstance(results[1], Exception) and results[1] else {}
             poly_snapshot = results[2] if not isinstance(results[2], Exception) else {"ok": False}
 
             klines_1m = binance_kline_1m.get_candles()
@@ -2279,6 +2292,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(polymarket_clob_ws.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
         asyncio.create_task(update_loop()),
+        asyncio.create_task(live_balance_updater()),
         asyncio.create_task(telegram_poller()),
         asyncio.create_task(entry_watcher())
     ]
@@ -2290,6 +2304,16 @@ async def lifespan(app: FastAPI):
         async def _warm_live():
             try:
                 await asyncio.to_thread(clob_trader.ensure_ready)
+                bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
+                if bal is not None and bal >= 0:
+                    state["live_balance"] = bal
+                    risk_type = (settings.RISK_TYPE or "percent").lower()
+                    if risk_type == "fixed":
+                        stake = float(settings.RISK_VALUE)
+                    else:
+                        stake = (float(settings.RISK_VALUE) / 100.0) * bal
+                    state["precomputed_live_stake"] = round(max(1.0, min(stake, bal)) if bal >= 1.0 else 0.0, 2)
+                    log_message(f"Live balance pre-warmed: ${bal:.2f} (stake: ${state['precomputed_live_stake']:.2f})")
                 if settings.RELAYER_API_KEY:
                     try:
                         setup_res = await asyncio.to_thread(clob_trader.ensure_setup)

@@ -357,8 +357,9 @@ class PolymarketChainlinkStream:
 
 class PolymarketClobMarketStream:
     """Real-time orderbook and price feed for active Polymarket tokens over CLOB Market WS."""
-    def __init__(self, ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"):
+    def __init__(self, ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market", on_update=None):
         self.ws_url = ws_url
+        self.on_update = on_update
         self.asset_ids: List[str] = []
         self.books: Dict[str, Dict] = {} # asset_id -> {"bids": [...], "asks": [...], "best_bid": float, "best_ask": float}
         self.book_levels: Dict[str, Dict[str, Dict[float, float]]] = {} # asset_id -> {"bids": {px: sz}, "asks": {px: sz}}
@@ -556,6 +557,12 @@ class PolymarketClobMarketStream:
                     if data.get("best_ask") is not None:
                         try: self.books[aid]["best_ask"] = float(data["best_ask"])
                         except (TypeError, ValueError): pass
+
+        if self.on_update:
+            try:
+                self.on_update(data)
+            except Exception:
+                pass
 
     def get_token_market(self, asset_id: str) -> Dict:
         return self.books.get(str(asset_id), {})

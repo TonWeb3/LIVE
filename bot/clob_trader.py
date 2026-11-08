@@ -403,6 +403,9 @@ class ClobTrader:
             st, addr = item[0], item[1]
             pusd_bal, usdc_e_bal = self._get_onchain_balances(gasless, addr)
             total_bal = max(pusd_bal, usdc_e_bal)
+            if total_bal > 0:
+                # Immediate early exit on first funded wallet (eliminates 10+ redundant RPC calls)
+                return st, addr
             if best is None or total_bal > best[2]:
                 best = (st, addr, total_bal)
 
@@ -632,12 +635,23 @@ class ClobTrader:
             )
             order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
             status = str(data.get("status", "")).lower()
+            making = _to_float(data.get("making_amount") or data.get("makingAmount"))
+            taking = _to_float(data.get("taking_amount") or data.get("takingAmount"))
+            usd, shares = making, taking
+            filled = (data.get("success") is not False
+                      and (status in ("matched", "filled", "closed"))
+                      and shares is not None and shares > 0
+                      and usd is not None and usd > 0)
+            fill_price = (usd / shares) if (filled and shares) else None
             return {
                 "ok": bool(order_id),
                 "order_id": order_id,
-                "status": status or "open",
-                "price": order_price,
-                "size": order_size,
+                "status": "filled" if filled else (status or "open"),
+                "price": fill_price or order_price,
+                "size": shares if filled else order_size,
+                "fill_price": fill_price,
+                "fill_size": shares if filled else None,
+                "fill_usd": usd if filled else None,
                 "expiration": exp,
                 "response": data
             }
